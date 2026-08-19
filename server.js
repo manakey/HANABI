@@ -17,6 +17,7 @@ const fs = require('fs');
 const { Readable } = require('stream');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
+const webpush = require('web-push');
 
 const app = express();
 const server = http.createServer(app);
@@ -39,6 +40,37 @@ if (USE_CLOUDINARY) {
   console.log('[storage] Cloudinary を使用します');
 } else {
   console.log('[storage] Cloudinary未設定のため、ローカルディスク(uploads/)を使用します');
+}
+
+// --- プッシュ通知: VAPIDキーが設定されていれば有効化 ---
+const USE_PUSH = !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+if (USE_PUSH) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+  console.log('[push] Web Push 通知を有効化しました');
+} else {
+  console.log('[push] VAPIDキー未設定のため、プッシュ通知は無効です（.env.example 参照）');
+}
+
+async function sendPushToUser(email, payload) {
+  if (!USE_PUSH) return;
+  const user = db.users[email];
+  if (!user || !user.pushSubscriptions || user.pushSubscriptions.length === 0) return;
+  const remaining = [];
+  for (const sub of user.pushSubscriptions) {
+    try {
+      await webpush.sendNotification(sub, JSON.stringify(payload));
+      remaining.push(sub);
+    } catch (err) {
+      // 410/404 = 購読が無効になっている → 削除。それ以外は一時的なエラーの可能性があるので残す
+      if (err.statusCode !== 404 && err.statusCode !== 410) remaining.push(sub);
+    }
+  }
+  user.pushSubscriptions = remaining;
+  persist();
 }
 
 const AVATAR_EMOJIS = ['😀','😎','🐱','🐶','🐼','🦊','🐸','🦁','🐯','🐨','🦄','🐵','👽','🤖','👻','🎃','🌸','🍉','⚽','🎮'];
@@ -133,7 +165,7 @@ app.post('/api/chats/dm', (req, res) => {
   if (!db.chats[chatId]) {
     db.chats[chatId] = {
       id: chatId, type: 'dm', name: null, avatar: null, members,
-      createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
+      createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(), reads: {},
     };
     db.messages[chatId] = [];
     persist();
@@ -147,8 +179,8 @@ app.post('/api/chats/group', (req, res) => {
   const chatId = 'group_' + uuidv4();
   const allMembers = Array.from(new Set([creator.toLowerCase(), ...members.map((m) => m.toLowerCase())]));
   db.chats[chatId] = {
-    id: chatId, type: 'group', name, avatar, members: allMembers,
-    createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
+    id: chatId, type: 'group', name, avatar, members: allMembers, admins: [creator.toLowerCase()],
+    createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(), reads: {},
   };
   db.messages[chatId] = [];
   persist();
@@ -157,6 +189,113 @@ app.post('/api/chats/group', (req, res) => {
 });
 
 app.get('/api/messages/:chatId', (req, res) => res.json(db.messages[req.params.chatId] || []));
+
+/* ---- グループ管理 ---- */
+
+function isAdmin(chat, email) { return !!chat && Array.isArray(chat.admins) && chat.admins.includes(email); }
+
+app.post('/api/chats/:chatId/rename', (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+  const requester = (req.body.requesterEmail || '').toLowerCase();
+  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ変更できます' });
+  if (req.body.name) chat.name = req.body.name.trim();
+  if (req.body.avatar) chat.avatar = req.body.avatar;
+  persist();
+  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  res.json(chat);
+});
+
+app.post('/api/chats/:chatId/members/add', (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+  const requester = (req.body.requesterEmail || '').toLowerCase();
+  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみメンバーを追加できます' });
+  const toAdd = (req.body.emails || []).map((e) => e.toLowerCase()).filter((e) => db.users[e] && !chat.members.includes(e));
+  chat.members.push(...toAdd);
+  persist();
+  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  toAdd.forEach((m) => io.to(`user:${m}`).emit('chat:new', chat)); // 新規メンバーには chat:new も送る
+  res.json(chat);
+});
+
+app.post('/api/chats/:chatId/members/remove', (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+  const requester = (req.body.requesterEmail || '').toLowerCase();
+  const target = (req.body.targetEmail || '').toLowerCase();
+  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみメンバーを削除できます' });
+  if (target === requester) return res.status(400).json({ error: '自分を削除する場合は退出機能を使ってください' });
+  chat.members = chat.members.filter((m) => m !== target);
+  chat.admins = (chat.admins || []).filter((m) => m !== target);
+  persist();
+  io.to(`user:${target}`).emit('chat:removed', { chatId: chat.id });
+  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  res.json(chat);
+});
+
+app.post('/api/chats/:chatId/leave', (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+  const email = (req.body.email || '').toLowerCase();
+  chat.members = chat.members.filter((m) => m !== email);
+  chat.admins = (chat.admins || []).filter((m) => m !== email);
+  if (chat.admins.length === 0 && chat.members.length > 0) chat.admins = [chat.members[0]]; // 管理者不在なら自動昇格
+  persist();
+  io.to(`user:${email}`).emit('chat:removed', { chatId: chat.id });
+  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  res.json({ ok: true });
+});
+
+app.post('/api/chats/:chatId/admins/promote', (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+  const requester = (req.body.requesterEmail || '').toLowerCase();
+  const target = (req.body.targetEmail || '').toLowerCase();
+  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ操作できます' });
+  if (!chat.admins.includes(target) && chat.members.includes(target)) chat.admins.push(target);
+  persist();
+  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  res.json(chat);
+});
+
+app.post('/api/chats/:chatId/admins/demote', (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+  const requester = (req.body.requesterEmail || '').toLowerCase();
+  const target = (req.body.targetEmail || '').toLowerCase();
+  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ操作できます' });
+  if (chat.admins.length <= 1 && chat.admins.includes(target)) return res.status(400).json({ error: '最後の管理者は降格できません' });
+  chat.admins = chat.admins.filter((m) => m !== target);
+  persist();
+  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  res.json(chat);
+});
+
+/* ---- プッシュ通知 購読管理 ---- */
+
+app.get('/api/push/vapid-public-key', (req, res) => res.json({ key: USE_PUSH ? process.env.VAPID_PUBLIC_KEY : null }));
+
+app.post('/api/push/subscribe', (req, res) => {
+  const email = (req.body.email || '').toLowerCase();
+  const sub = req.body.subscription;
+  if (!db.users[email] || !sub || !sub.endpoint) return res.status(400).json({ error: 'invalid' });
+  if (!db.users[email].pushSubscriptions) db.users[email].pushSubscriptions = [];
+  const exists = db.users[email].pushSubscriptions.find((s) => s.endpoint === sub.endpoint);
+  if (!exists) db.users[email].pushSubscriptions.push(sub);
+  persist();
+  res.json({ ok: true });
+});
+
+app.post('/api/push/unsubscribe', (req, res) => {
+  const email = (req.body.email || '').toLowerCase();
+  const endpoint = req.body.endpoint;
+  if (db.users[email] && db.users[email].pushSubscriptions) {
+    db.users[email].pushSubscriptions = db.users[email].pushSubscriptions.filter((s) => s.endpoint !== endpoint);
+    persist();
+  }
+  res.json({ ok: true });
+});
 
 app.post('/api/upload', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'no file' });
@@ -189,23 +328,48 @@ io.on('connection', (socket) => {
 
   socket.on('chat:join', (chatId) => socket.join(chatId));
 
+  socket.on('chat:read', ({ chatId, email }) => {
+    const chat = db.chats[chatId];
+    if (!chat) return;
+    if (!chat.reads) chat.reads = {};
+    chat.reads[email] = Date.now();
+    persist();
+    io.to(chatId).emit('read:updated', { chatId, email, ts: chat.reads[email] });
+  });
+
   socket.on('message:send', ({ chatId, message }) => {
     if (!db.messages[chatId]) db.messages[chatId] = [];
     db.messages[chatId].push(message);
     if (db.messages[chatId].length > 500) db.messages[chatId] = db.messages[chatId].slice(-500);
-    if (db.chats[chatId]) {
-      db.chats[chatId].lastMessage = message.preview;
-      db.chats[chatId].lastMessageTime = message.ts;
+    const chat = db.chats[chatId];
+    if (chat) {
+      chat.lastMessage = message.preview;
+      chat.lastMessageTime = message.ts;
     }
     persist();
     io.to(chatId).emit('message:new', { chatId, message });
-    if (db.chats[chatId]) {
-      db.chats[chatId].members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', db.chats[chatId]));
+    if (chat) {
+      chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+      // オフライン/バックグラウンドのメンバーへプッシュ通知
+      const sender = db.users[message.sender] || { name: message.sender };
+      const title = chat.type === 'group' ? chat.name : sender.name;
+      const body = chat.type === 'group' ? `${sender.name}: ${message.preview}` : message.preview;
+      chat.members.filter((m) => m !== message.sender).forEach((m) => {
+        sendPushToUser(m, { title, body, url: '/', tag: `chat-${chatId}` });
+      });
     }
   });
 
   // --- WebRTC signaling relay (音声・ビデオ通話) ---
-  socket.on('call:invite', (data) => io.to(`user:${data.toEmail}`).emit('call:incoming', data));
+  socket.on('call:invite', (data) => {
+    io.to(`user:${data.toEmail}`).emit('call:incoming', data);
+    const caller = db.users[data.fromEmail];
+    sendPushToUser(data.toEmail, {
+      title: `${caller ? caller.name : data.fromEmail} から着信`,
+      body: data.video ? 'ビデオ通話の着信です' : '音声通話の着信です',
+      url: '/', tag: 'call',
+    });
+  });
   socket.on('call:answer', (data) => io.to(`user:${data.toEmail}`).emit('call:answered', data));
   socket.on('call:ice-candidate', (data) => io.to(`user:${data.toEmail}`).emit('call:ice-candidate', data));
   socket.on('call:end', (data) => io.to(`user:${data.toEmail}`).emit('call:ended', data));
