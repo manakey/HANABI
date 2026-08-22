@@ -546,7 +546,7 @@ function buildReplyPreview(msg) {
 function openMessageActions(msg) {
   const mine = msg.sender === state.user.email;
   const overlay = openModal('メッセージ', '', false);
-  const body = document.getElementById('modal-body');
+  const body = overlay.bodyEl;
   body.innerHTML = `
     <button class="action-btn" id="action-reply">↩️ 返信する</button>
     ${mine ? `<button class="action-btn danger" id="action-delete">🗑 削除する</button>` : ''}
@@ -674,7 +674,7 @@ function updateLocalChat(chat) {
 
 function openGroupInfoModal(chatId) {
   const overlay = openModal('グループ情報', '', true);
-  const body = document.getElementById('modal-body');
+  const body = overlay.bodyEl;
 
   function renderInfo() {
     const c = currentChatById(chatId);
@@ -731,7 +731,10 @@ function openGroupInfoModal(chatId) {
         updateLocalChat(updated);
         renderInfo();
       };
-      document.getElementById('add-member-btn').onclick = () => openAddMembersModal(chatId, renderInfo);
+      document.getElementById('add-member-btn').onclick = () => {
+        document.body.removeChild(overlay); // グループ情報モーダルを閉じてから追加モーダルを開く(二重表示防止)
+        openAddMembersModal(chatId, () => openGroupInfoModal(chatId));
+      };
     }
 
     body.querySelectorAll('[data-promote]').forEach((b) => b.onclick = async () => {
@@ -766,7 +769,7 @@ function openAddMembersModal(parentChatId, onDone) {
   const candidates = state.directory.filter((u) => u.email !== state.user.email && !chat.members.includes(u.email));
   const selected = new Set();
   const overlay = openModal('メンバーを追加', '', true);
-  const body = document.getElementById('modal-body');
+  const body = overlay.bodyEl;
 
   if (candidates.length === 0) {
     body.innerHTML = `<div style="text-align:center;color:var(--text-dim);font-size:13px;padding:20px 0">追加できるユーザーがいません。</div>`;
@@ -802,17 +805,20 @@ function openAddMembersModal(parentChatId, onDone) {
 
 /* ------------------------------- PROFILE MODAL ------------------------------- */
 
+let modalSeq = 0;
 function openModal(title, bodyHTML, wide) {
+  const bodyId = `modal-body-${++modalSeq}`;
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
     <div class="modal-box ${wide ? 'wide' : ''}">
       <div class="modal-title-row"><h3>${esc(title)}</h3><button class="modal-close">✕</button></div>
-      <div id="modal-body">${bodyHTML}</div>
+      <div id="${bodyId}">${bodyHTML}</div>
     </div>`;
   overlay.onclick = (e) => { if (e.target === overlay) document.body.removeChild(overlay); };
   overlay.querySelector('.modal-close').onclick = () => document.body.removeChild(overlay);
   document.body.appendChild(overlay);
+  overlay.bodyEl = overlay.querySelector(`#${bodyId}`);
   return overlay;
 }
 
@@ -868,7 +874,7 @@ function openNewChatModal() {
   const others = state.directory.filter((u) => u.email !== state.user.email);
 
   const overlay = openModal('新しいチャット', '', true);
-  const body = document.getElementById('modal-body');
+  const body = overlay.bodyEl;
 
   function renderBody() {
     body.innerHTML = `
