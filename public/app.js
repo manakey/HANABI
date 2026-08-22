@@ -186,14 +186,15 @@ function connectSocket() {
     if (chatId === state.activeChatId) renderMessages();
   });
 
-  socket.on('message:new', ({ chatId, message }) => {
-    if (chatId === state.activeChatId) {
-      state.messages.push(message);
-      renderMessages();
-      markChatRead(chatId);
-    }
-  });
-
+socket.on('message:new', ({ chatId, message }) => {
+  if (chatId === state.activeChatId) {
+    const exists = state.messages.some((m) => m.id === message.id);
+    if (!exists) state.messages.push(message);
+    renderMessages();
+    markChatRead(chatId);
+  }
+});
+  
   socket.on('directory:updated', (u) => {
     const idx = state.directory.findIndex((d) => d.email === u.email);
     if (idx >= 0) state.directory[idx] = u; else state.directory.push(u);
