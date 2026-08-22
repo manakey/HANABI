@@ -1,10 +1,6 @@
 /**
  * Hanabi Chat — LINE風リアルタイムチャット
- * Express + Socket.IO + JSONファイルベースの簡易DB
- *
- * データは db.json に保存されます。本番運用では MongoDB / PostgreSQL 等の
- * 永続DBに置き換えることを推奨します（デプロイ先のディスクが
- * エフェメラル(再デプロイで消える)な場合、db.json も消えます）。
+ * Express + Socket.IO + PostgreSQL
  */
 require('dotenv').config();
 const express = require('express');
@@ -20,13 +16,13 @@ const { Readable } = require('stream');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
 const webpush = require('web-push');
+const db = require('./db');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'db.json');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -59,37 +55,27 @@ if (USE_PUSH) {
 
 async function sendPushToUser(email, payload) {
   if (!USE_PUSH) return;
-  const user = db.users[email];
-  if (!user || !user.pushSubscriptions || user.pushSubscriptions.length === 0) return;
-  const remaining = [];
-  for (const sub of user.pushSubscriptions) {
-    try {
-      await webpush.sendNotification(sub, JSON.stringify(payload));
-      remaining.push(sub);
-    } catch (err) {
-      // 410/404 = 購読が無効になっている → 削除。それ以外は一時的なエラーの可能性があるので残す
-      if (err.statusCode !== 404 && err.statusCode !== 410) remaining.push(sub);
+  try {
+    const subs = await db.getPushSubscriptions(email);
+    if (!subs || subs.length === 0) return;
+    const remaining = [];
+    for (const sub of subs) {
+      try {
+        await webpush.sendNotification(sub, JSON.stringify(payload));
+        remaining.push(sub);
+      } catch (err) {
+        // 410/404 = 購読が無効になっている → 削除。それ以外は一時的なエラーの可能性があるので残す
+        if (err.statusCode !== 404 && err.statusCode !== 410) remaining.push(sub);
+      }
     }
+    if (remaining.length !== subs.length) await db.setPushSubscriptions(email, remaining);
+  } catch (err) {
+    console.error('sendPushToUser error:', err);
   }
-  user.pushSubscriptions = remaining;
-  persist();
 }
 
 const AVATAR_EMOJIS = ['😀','😎','🐱','🐶','🐼','🦊','🐸','🦁','🐯','🐨','🦄','🐵','👽','🤖','👻','🎃','🌸','🍉','⚽','🎮'];
 const AVATAR_COLORS = ['#1E7A5E','#FF6B4A','#4C6FFF','#F5A623','#B14CFF','#FF4C8B','#17A398','#2E3A59'];
-
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) return { users: {}, chats: {}, messages: {} };
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8')); }
-  catch { return { users: {}, chats: {}, messages: {} }; }
-}
-let db = loadDB();
-let saveTimer = null;
-function persist() {
-  // 書き込みを軽くデバウンス
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db), () => {}), 150);
-}
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
@@ -116,87 +102,103 @@ function uploadBufferToCloudinary(buffer) {
 
 /* ------------------------------- REST API ------------------------------- */
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const emailRaw = (req.body.email || '').trim().toLowerCase();
   const name = (req.body.name || '').trim();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailRaw)) {
     return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
   }
-  let user = db.users[emailRaw];
-  if (!user) {
-    if (!name) return res.json({ needName: true });
-    user = {
-      email: emailRaw,
-      name,
-      avatar: AVATAR_EMOJIS[Math.floor(Math.random() * AVATAR_EMOJIS.length)],
-      bg: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
-      createdAt: Date.now(),
-    };
-    db.users[emailRaw] = user;
-    persist();
+  try {
+    let user = await db.getUser(emailRaw);
+    if (!user) {
+      if (!name) return res.json({ needName: true });
+      user = await db.createUser({
+        email: emailRaw,
+        name,
+        avatar: AVATAR_EMOJIS[Math.floor(Math.random() * AVATAR_EMOJIS.length)],
+        bg: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
+        createdAt: Date.now(),
+      });
+    }
+    res.json({ user });
+  } catch (err) {
+    console.error('login error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
-  res.json({ user });
 });
 
-app.get('/api/directory', (req, res) => res.json(Object.values(db.users)));
-
-app.put('/api/profile', (req, res) => {
-  const email = (req.body.email || '').toLowerCase();
-  if (!db.users[email]) return res.status(404).json({ error: 'not found' });
-  db.users[email] = {
-    ...db.users[email],
-    name: req.body.name || db.users[email].name,
-    avatar: req.body.avatar || db.users[email].avatar,
-    bg: req.body.bg || db.users[email].bg,
-  };
-  persist();
-  io.emit('directory:updated', db.users[email]);
-  res.json({ user: db.users[email] });
+app.get('/api/directory', async (req, res) => {
+  try { res.json(await db.listUsers()); }
+  catch (err) { console.error('directory error:', err); res.status(500).json([]); }
 });
 
-app.get('/api/chats/:email', (req, res) => {
-  const email = req.params.email.toLowerCase();
-  const chats = Object.values(db.chats).filter((c) => c.members.includes(email));
-  chats.sort((a, b) => (b.lastMessageTime || 0) - (a.lastMessageTime || 0));
-  const withUnread = chats.map((c) => {
-    const readTs = (c.reads && c.reads[email]) || 0;
-    const list = db.messages[c.id] || [];
-    const unreadCount = list.filter((m) => m.ts > readTs && m.sender !== email && !m.deleted).length;
-    return { ...c, unreadCount };
-  });
-  res.json(withUnread);
-});
-
-app.post('/api/chats/dm', (req, res) => {
-  const members = [req.body.a, req.body.b].map((e) => e.toLowerCase()).sort();
-  const chatId = 'dm_' + members.join('__');
-  if (!db.chats[chatId]) {
-    db.chats[chatId] = {
-      id: chatId, type: 'dm', name: null, avatar: null, members,
-      createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(), reads: {},
-    };
-    db.messages[chatId] = [];
-    persist();
-    members.forEach((m) => io.to(`user:${m}`).emit('chat:new', db.chats[chatId]));
+app.put('/api/profile', async (req, res) => {
+  try {
+    const email = (req.body.email || '').toLowerCase();
+    const existing = await db.getUser(email);
+    if (!existing) return res.status(404).json({ error: 'not found' });
+    const user = await db.updateUserProfile(email, {
+      name: req.body.name || existing.name,
+      avatar: req.body.avatar || existing.avatar,
+      bg: req.body.bg || existing.bg,
+    });
+    io.emit('directory:updated', user);
+    res.json({ user });
+  } catch (err) {
+    console.error('profile update error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
-  res.json(db.chats[chatId]);
 });
 
-app.post('/api/chats/group', (req, res) => {
-  const { name, avatar, members, creator } = req.body;
-  const chatId = 'group_' + uuidv4();
-  const allMembers = Array.from(new Set([creator.toLowerCase(), ...members.map((m) => m.toLowerCase())]));
-  db.chats[chatId] = {
-    id: chatId, type: 'group', name, avatar, members: allMembers, admins: [creator.toLowerCase()],
-    createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(), reads: {},
-  };
-  db.messages[chatId] = [];
-  persist();
-  allMembers.forEach((m) => io.to(`user:${m}`).emit('chat:new', db.chats[chatId]));
-  res.json(db.chats[chatId]);
+app.get('/api/chats/:email', async (req, res) => {
+  try {
+    res.json(await db.listChatsForUser(req.params.email.toLowerCase()));
+  } catch (err) {
+    console.error('list chats error:', err);
+    res.status(500).json([]);
+  }
 });
 
-app.get('/api/messages/:chatId', (req, res) => res.json(db.messages[req.params.chatId] || []));
+app.post('/api/chats/dm', async (req, res) => {
+  try {
+    const members = [req.body.a, req.body.b].map((e) => e.toLowerCase()).sort();
+    const chatId = 'dm_' + members.join('__');
+    let chat = await db.getChat(chatId);
+    if (!chat) {
+      chat = await db.createChat({
+        id: chatId, type: 'dm', name: null, avatar: null, members, admins: [], reads: {},
+        createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
+      });
+      members.forEach((m) => io.to(`user:${m}`).emit('chat:new', chat));
+    }
+    res.json(chat);
+  } catch (err) {
+    console.error('create dm error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.post('/api/chats/group', async (req, res) => {
+  try {
+    const { name, avatar, members, creator } = req.body;
+    const chatId = 'group_' + uuidv4();
+    const allMembers = Array.from(new Set([creator.toLowerCase(), ...members.map((m) => m.toLowerCase())]));
+    const chat = await db.createChat({
+      id: chatId, type: 'group', name, avatar, members: allMembers, admins: [creator.toLowerCase()], reads: {},
+      createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
+    });
+    allMembers.forEach((m) => io.to(`user:${m}`).emit('chat:new', chat));
+    res.json(chat);
+  } catch (err) {
+    console.error('create group error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.get('/api/messages/:chatId', async (req, res) => {
+  try { res.json(await db.listMessages(req.params.chatId)); }
+  catch (err) { console.error('list messages error:', err); res.status(500).json([]); }
+});
 
 /* ---- リンクプレビュー ---- */
 
@@ -272,107 +274,144 @@ app.get('/api/link-preview', async (req, res) => {
 
 function isAdmin(chat, email) { return !!chat && Array.isArray(chat.admins) && chat.admins.includes(email); }
 
-app.post('/api/chats/:chatId/rename', (req, res) => {
-  const chat = db.chats[req.params.chatId];
-  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
-  const requester = (req.body.requesterEmail || '').toLowerCase();
-  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ変更できます' });
-  if (req.body.name) chat.name = req.body.name.trim();
-  if (req.body.avatar) chat.avatar = req.body.avatar;
-  persist();
-  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-  res.json(chat);
+app.post('/api/chats/:chatId/rename', async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+    const requester = (req.body.requesterEmail || '').toLowerCase();
+    if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ変更できます' });
+    const fields = {};
+    if (req.body.name) fields.name = req.body.name.trim();
+    if (req.body.avatar) fields.avatar = req.body.avatar;
+    const updated = await db.updateChatFields(chat.id, fields);
+    updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) {
+    console.error('rename group error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
-app.post('/api/chats/:chatId/members/add', (req, res) => {
-  const chat = db.chats[req.params.chatId];
-  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
-  const requester = (req.body.requesterEmail || '').toLowerCase();
-  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみメンバーを追加できます' });
-  const toAdd = (req.body.emails || []).map((e) => e.toLowerCase()).filter((e) => db.users[e] && !chat.members.includes(e));
-  chat.members.push(...toAdd);
-  persist();
-  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-  toAdd.forEach((m) => io.to(`user:${m}`).emit('chat:new', chat)); // 新規メンバーには chat:new も送る
-  res.json(chat);
+app.post('/api/chats/:chatId/members/add', async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+    const requester = (req.body.requesterEmail || '').toLowerCase();
+    if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみメンバーを追加できます' });
+    const candidates = (req.body.emails || []).map((e) => e.toLowerCase()).filter((e) => !chat.members.includes(e));
+    const toAdd = [];
+    for (const e of candidates) { if (await db.getUser(e)) toAdd.push(e); }
+    const updated = await db.updateChatFields(chat.id, { members: [...chat.members, ...toAdd] });
+    updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    toAdd.forEach((m) => io.to(`user:${m}`).emit('chat:new', updated)); // 新規メンバーには chat:new も送る
+    res.json(updated);
+  } catch (err) {
+    console.error('add members error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
-app.post('/api/chats/:chatId/members/remove', (req, res) => {
-  const chat = db.chats[req.params.chatId];
-  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
-  const requester = (req.body.requesterEmail || '').toLowerCase();
-  const target = (req.body.targetEmail || '').toLowerCase();
-  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみメンバーを削除できます' });
-  if (target === requester) return res.status(400).json({ error: '自分を削除する場合は退出機能を使ってください' });
-  chat.members = chat.members.filter((m) => m !== target);
-  chat.admins = (chat.admins || []).filter((m) => m !== target);
-  persist();
-  io.to(`user:${target}`).emit('chat:removed', { chatId: chat.id });
-  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-  res.json(chat);
+app.post('/api/chats/:chatId/members/remove', async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+    const requester = (req.body.requesterEmail || '').toLowerCase();
+    const target = (req.body.targetEmail || '').toLowerCase();
+    if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみメンバーを削除できます' });
+    if (target === requester) return res.status(400).json({ error: '自分を削除する場合は退出機能を使ってください' });
+    const updated = await db.updateChatFields(chat.id, {
+      members: chat.members.filter((m) => m !== target),
+      admins: chat.admins.filter((m) => m !== target),
+    });
+    io.to(`user:${target}`).emit('chat:removed', { chatId: chat.id });
+    updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) {
+    console.error('remove member error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
-app.post('/api/chats/:chatId/leave', (req, res) => {
-  const chat = db.chats[req.params.chatId];
-  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
-  const email = (req.body.email || '').toLowerCase();
-  chat.members = chat.members.filter((m) => m !== email);
-  chat.admins = (chat.admins || []).filter((m) => m !== email);
-  if (chat.admins.length === 0 && chat.members.length > 0) chat.admins = [chat.members[0]]; // 管理者不在なら自動昇格
-  persist();
-  io.to(`user:${email}`).emit('chat:removed', { chatId: chat.id });
-  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-  res.json({ ok: true });
+app.post('/api/chats/:chatId/leave', async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+    const email = (req.body.email || '').toLowerCase();
+    const members = chat.members.filter((m) => m !== email);
+    let admins = chat.admins.filter((m) => m !== email);
+    if (admins.length === 0 && members.length > 0) admins = [members[0]]; // 管理者不在なら自動昇格
+    const updated = await db.updateChatFields(chat.id, { members, admins });
+    io.to(`user:${email}`).emit('chat:removed', { chatId: chat.id });
+    updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('leave group error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
-app.post('/api/chats/:chatId/admins/promote', (req, res) => {
-  const chat = db.chats[req.params.chatId];
-  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
-  const requester = (req.body.requesterEmail || '').toLowerCase();
-  const target = (req.body.targetEmail || '').toLowerCase();
-  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ操作できます' });
-  if (!chat.admins.includes(target) && chat.members.includes(target)) chat.admins.push(target);
-  persist();
-  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-  res.json(chat);
+app.post('/api/chats/:chatId/admins/promote', async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+    const requester = (req.body.requesterEmail || '').toLowerCase();
+    const target = (req.body.targetEmail || '').toLowerCase();
+    if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ操作できます' });
+    let admins = chat.admins;
+    if (!admins.includes(target) && chat.members.includes(target)) admins = [...admins, target];
+    const updated = await db.updateChatFields(chat.id, { admins });
+    updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) {
+    console.error('promote admin error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
-app.post('/api/chats/:chatId/admins/demote', (req, res) => {
-  const chat = db.chats[req.params.chatId];
-  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
-  const requester = (req.body.requesterEmail || '').toLowerCase();
-  const target = (req.body.targetEmail || '').toLowerCase();
-  if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ操作できます' });
-  if (chat.admins.length <= 1 && chat.admins.includes(target)) return res.status(400).json({ error: '最後の管理者は降格できません' });
-  chat.admins = chat.admins.filter((m) => m !== target);
-  persist();
-  chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-  res.json(chat);
+app.post('/api/chats/:chatId/admins/demote', async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'not found' });
+    const requester = (req.body.requesterEmail || '').toLowerCase();
+    const target = (req.body.targetEmail || '').toLowerCase();
+    if (!isAdmin(chat, requester)) return res.status(403).json({ error: '管理者のみ操作できます' });
+    if (chat.admins.length <= 1 && chat.admins.includes(target)) return res.status(400).json({ error: '最後の管理者は降格できません' });
+    const updated = await db.updateChatFields(chat.id, { admins: chat.admins.filter((m) => m !== target) });
+    updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) {
+    console.error('demote admin error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
 /* ---- プッシュ通知 購読管理 ---- */
 
 app.get('/api/push/vapid-public-key', (req, res) => res.json({ key: USE_PUSH ? process.env.VAPID_PUBLIC_KEY : null }));
 
-app.post('/api/push/subscribe', (req, res) => {
-  const email = (req.body.email || '').toLowerCase();
-  const sub = req.body.subscription;
-  if (!db.users[email] || !sub || !sub.endpoint) return res.status(400).json({ error: 'invalid' });
-  if (!db.users[email].pushSubscriptions) db.users[email].pushSubscriptions = [];
-  const exists = db.users[email].pushSubscriptions.find((s) => s.endpoint === sub.endpoint);
-  if (!exists) db.users[email].pushSubscriptions.push(sub);
-  persist();
-  res.json({ ok: true });
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const email = (req.body.email || '').toLowerCase();
+    const sub = req.body.subscription;
+    const user = await db.getUser(email);
+    if (!user || !sub || !sub.endpoint) return res.status(400).json({ error: 'invalid' });
+    await db.addPushSubscription(email, sub);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('push subscribe error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
-app.post('/api/push/unsubscribe', (req, res) => {
-  const email = (req.body.email || '').toLowerCase();
-  const endpoint = req.body.endpoint;
-  if (db.users[email] && db.users[email].pushSubscriptions) {
-    db.users[email].pushSubscriptions = db.users[email].pushSubscriptions.filter((s) => s.endpoint !== endpoint);
-    persist();
+app.post('/api/push/unsubscribe', async (req, res) => {
+  try {
+    const email = (req.body.email || '').toLowerCase();
+    await db.removePushSubscription(email, req.body.endpoint);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('push unsubscribe error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
-  res.json({ ok: true });
 });
 
 app.post('/api/upload', upload.single('image'), async (req, res) => {
@@ -396,74 +435,68 @@ app.get('/healthz', (req, res) => res.send('ok'));
 io.on('connection', (socket) => {
   let currentEmail = null;
 
-  socket.on('auth', (email) => {
+  socket.on('auth', async (email) => {
     currentEmail = (email || '').toLowerCase();
     socket.join(`user:${currentEmail}`);
-    Object.values(db.chats)
-      .filter((c) => c.members.includes(currentEmail))
-      .forEach((c) => socket.join(c.id));
+    try {
+      const chatIds = await db.listChatIdsForUser(currentEmail);
+      chatIds.forEach((id) => socket.join(id));
+    } catch (err) { console.error('socket auth error:', err); }
   });
 
   socket.on('chat:join', (chatId) => socket.join(chatId));
 
-  socket.on('chat:read', ({ chatId, email }) => {
-    const chat = db.chats[chatId];
-    if (!chat) return;
-    if (!chat.reads) chat.reads = {};
-    chat.reads[email] = Date.now();
-    persist();
-    io.to(chatId).emit('read:updated', { chatId, email, ts: chat.reads[email] });
+  socket.on('chat:read', async ({ chatId, email }) => {
+    try {
+      const ts = Date.now();
+      await db.setChatRead(chatId, email, ts);
+      io.to(chatId).emit('read:updated', { chatId, email, ts });
+    } catch (err) { console.error('chat:read error:', err); }
   });
 
-  socket.on('message:send', ({ chatId, message }) => {
-    if (!db.messages[chatId]) db.messages[chatId] = [];
-    db.messages[chatId].push(message);
-    if (db.messages[chatId].length > 500) db.messages[chatId] = db.messages[chatId].slice(-500);
-    const chat = db.chats[chatId];
-    if (chat) {
-      chat.lastMessage = message.preview;
-      chat.lastMessageTime = message.ts;
-    }
-    persist();
-    io.to(chatId).emit('message:new', { chatId, message });
-    if (chat) {
-      chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-      // オフライン/バックグラウンドのメンバーへプッシュ通知
-      const sender = db.users[message.sender] || { name: message.sender };
-      const title = chat.type === 'group' ? chat.name : sender.name;
-      const body = chat.type === 'group' ? `${sender.name}: ${message.preview}` : message.preview;
-      chat.members.filter((m) => m !== message.sender).forEach((m) => {
-        sendPushToUser(m, { title, body, url: '/', tag: `chat-${chatId}` });
-      });
-    }
+  socket.on('message:send', async ({ chatId, message }) => {
+    try {
+      await db.addMessage(chatId, message);
+      const chat = await db.updateChatFields(chatId, { lastMessage: message.preview, lastMessageTime: message.ts });
+      io.to(chatId).emit('message:new', { chatId, message });
+      if (chat) {
+        chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+        // オフライン/バックグラウンドのメンバーへプッシュ通知
+        const sender = await db.getUser(message.sender);
+        const senderName = sender ? sender.name : message.sender;
+        const title = chat.type === 'group' ? chat.name : senderName;
+        const body = chat.type === 'group' ? `${senderName}: ${message.preview}` : message.preview;
+        chat.members.filter((m) => m !== message.sender).forEach((m) => {
+          sendPushToUser(m, { title, body, url: '/', tag: `chat-${chatId}` });
+        });
+      }
+    } catch (err) { console.error('message:send error:', err); }
   });
 
-  socket.on('message:delete', ({ chatId, messageId, email }) => {
-    const list = db.messages[chatId];
-    if (!list) return;
-    const msg = list.find((m) => m.id === messageId);
-    if (!msg || msg.sender !== email || msg.deleted) return; // 本人のメッセージのみ削除可
-    msg.deleted = true;
-    msg.content = '';
-    msg.preview = 'メッセージを削除しました';
-    const chat = db.chats[chatId];
-    if (chat && chat.lastMessageTime === msg.ts) {
-      chat.lastMessage = 'メッセージを削除しました';
-    }
-    persist();
-    io.to(chatId).emit('message:deleted', { chatId, messageId });
-    if (chat) chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+  socket.on('message:delete', async ({ chatId, messageId, email }) => {
+    try {
+      const deletedMsg = await db.softDeleteMessage(chatId, messageId, email);
+      if (!deletedMsg) return; // 本人のメッセージのみ削除可
+      const chat = await db.getChat(chatId);
+      if (chat && chat.lastMessageTime === deletedMsg.ts) {
+        await db.updateChatFields(chatId, { lastMessage: 'メッセージを削除しました' });
+      }
+      io.to(chatId).emit('message:deleted', { chatId, messageId });
+      if (chat) chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
+    } catch (err) { console.error('message:delete error:', err); }
   });
 
   // --- WebRTC signaling relay (音声・ビデオ通話) ---
-  socket.on('call:invite', (data) => {
+  socket.on('call:invite', async (data) => {
     io.to(`user:${data.toEmail}`).emit('call:incoming', data);
-    const caller = db.users[data.fromEmail];
-    sendPushToUser(data.toEmail, {
-      title: `${caller ? caller.name : data.fromEmail} から着信`,
-      body: data.video ? 'ビデオ通話の着信です' : '音声通話の着信です',
-      url: '/', tag: 'call',
-    });
+    try {
+      const caller = await db.getUser(data.fromEmail);
+      sendPushToUser(data.toEmail, {
+        title: `${caller ? caller.name : data.fromEmail} から着信`,
+        body: data.video ? 'ビデオ通話の着信です' : '音声通話の着信です',
+        url: '/', tag: 'call',
+      });
+    } catch (err) { console.error('call push error:', err); }
   });
   socket.on('call:answer', (data) => io.to(`user:${data.toEmail}`).emit('call:answered', data));
   socket.on('call:ice-candidate', (data) => io.to(`user:${data.toEmail}`).emit('call:ice-candidate', data));
@@ -476,4 +509,14 @@ io.on('connection', (socket) => {
 // SPA フォールバック
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-server.listen(PORT, () => console.log(`Hanabi server listening on port ${PORT}`));
+async function start() {
+  try {
+    await db.initSchema();
+  } catch (err) {
+    console.error('[db] スキーマ初期化に失敗しました。DATABASE_URLが正しく設定されているか確認してください。', err);
+    process.exit(1);
+  }
+  server.listen(PORT, () => console.log(`Hanabi server listening on port ${PORT}`));
+}
+
+start();
