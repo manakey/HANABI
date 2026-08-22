@@ -19,7 +19,6 @@ const fs = require('fs');
 const { Readable } = require('stream');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
-const webpush = require('web-push');
 
 const app = express();
 const server = http.createServer(app);
@@ -42,37 +41,6 @@ if (USE_CLOUDINARY) {
   console.log('[storage] Cloudinary を使用します');
 } else {
   console.log('[storage] Cloudinary未設定のため、ローカルディスク(uploads/)を使用します');
-}
-
-// --- プッシュ通知: VAPIDキーが設定されていれば有効化 ---
-const USE_PUSH = !!(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
-if (USE_PUSH) {
-  webpush.setVapidDetails(
-    process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
-    process.env.VAPID_PUBLIC_KEY,
-    process.env.VAPID_PRIVATE_KEY
-  );
-  console.log('[push] Web Push 通知を有効化しました');
-} else {
-  console.log('[push] VAPIDキー未設定のため、プッシュ通知は無効です（.env.example 参照）');
-}
-
-async function sendPushToUser(email, payload) {
-  if (!USE_PUSH) return;
-  const user = db.users[email];
-  if (!user || !user.pushSubscriptions || user.pushSubscriptions.length === 0) return;
-  const remaining = [];
-  for (const sub of user.pushSubscriptions) {
-    try {
-      await webpush.sendNotification(sub, JSON.stringify(payload));
-      remaining.push(sub);
-    } catch (err) {
-      // 410/404 = 購読が無効になっている → 削除。それ以外は一時的なエラーの可能性があるので残す
-      if (err.statusCode !== 404 && err.statusCode !== 410) remaining.push(sub);
-    }
-  }
-  user.pushSubscriptions = remaining;
-  persist();
 }
 
 const AVATAR_EMOJIS = ['😀','😎','🐱','🐶','🐼','🦊','🐸','🦁','🐯','🐨','🦄','🐵','👽','🤖','👻','🎃','🌸','🍉','⚽','🎮'];
@@ -173,7 +141,7 @@ app.post('/api/chats/dm', (req, res) => {
   if (!db.chats[chatId]) {
     db.chats[chatId] = {
       id: chatId, type: 'dm', name: null, avatar: null, members,
-      createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(), reads: {},
+      createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
     };
     db.messages[chatId] = [];
     persist();
@@ -187,8 +155,8 @@ app.post('/api/chats/group', (req, res) => {
   const chatId = 'group_' + uuidv4();
   const allMembers = Array.from(new Set([creator.toLowerCase(), ...members.map((m) => m.toLowerCase())]));
   db.chats[chatId] = {
-    id: chatId, type: 'group', name, avatar, members: allMembers, admins: [creator.toLowerCase()],
-    createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(), reads: {},
+    id: chatId, type: 'group', name, avatar, members: allMembers,
+    createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
   };
   db.messages[chatId] = [];
   persist();
@@ -406,23 +374,13 @@ io.on('connection', (socket) => {
 
   socket.on('chat:join', (chatId) => socket.join(chatId));
 
-  socket.on('chat:read', ({ chatId, email }) => {
-    const chat = db.chats[chatId];
-    if (!chat) return;
-    if (!chat.reads) chat.reads = {};
-    chat.reads[email] = Date.now();
-    persist();
-    io.to(chatId).emit('read:updated', { chatId, email, ts: chat.reads[email] });
-  });
-
   socket.on('message:send', ({ chatId, message }) => {
     if (!db.messages[chatId]) db.messages[chatId] = [];
     db.messages[chatId].push(message);
     if (db.messages[chatId].length > 500) db.messages[chatId] = db.messages[chatId].slice(-500);
-    const chat = db.chats[chatId];
-    if (chat) {
-      chat.lastMessage = message.preview;
-      chat.lastMessageTime = message.ts;
+    if (db.chats[chatId]) {
+      db.chats[chatId].lastMessage = message.preview;
+      db.chats[chatId].lastMessageTime = message.ts;
     }
     persist();
     io.to(chatId).emit('message:new', { chatId, message });
@@ -456,15 +414,7 @@ io.on('connection', (socket) => {
   });
 
   // --- WebRTC signaling relay (音声・ビデオ通話) ---
-  socket.on('call:invite', (data) => {
-    io.to(`user:${data.toEmail}`).emit('call:incoming', data);
-    const caller = db.users[data.fromEmail];
-    sendPushToUser(data.toEmail, {
-      title: `${caller ? caller.name : data.fromEmail} から着信`,
-      body: data.video ? 'ビデオ通話の着信です' : '音声通話の着信です',
-      url: '/', tag: 'call',
-    });
-  });
+  socket.on('call:invite', (data) => io.to(`user:${data.toEmail}`).emit('call:incoming', data));
   socket.on('call:answer', (data) => io.to(`user:${data.toEmail}`).emit('call:answered', data));
   socket.on('call:ice-candidate', (data) => io.to(`user:${data.toEmail}`).emit('call:ice-candidate', data));
   socket.on('call:end', (data) => io.to(`user:${data.toEmail}`).emit('call:ended', data));
