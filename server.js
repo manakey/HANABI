@@ -9,6 +9,8 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
+const https = require('https');
+const { URL } = require('url');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const multer = require('multer');
@@ -156,7 +158,13 @@ app.get('/api/chats/:email', (req, res) => {
   const email = req.params.email.toLowerCase();
   const chats = Object.values(db.chats).filter((c) => c.members.includes(email));
   chats.sort((a, b) => (b.lastMessageTime || 0) - (a.lastMessageTime || 0));
-  res.json(chats);
+  const withUnread = chats.map((c) => {
+    const readTs = (c.reads && c.reads[email]) || 0;
+    const list = db.messages[c.id] || [];
+    const unreadCount = list.filter((m) => m.ts > readTs && m.sender !== email && !m.deleted).length;
+    return { ...c, unreadCount };
+  });
+  res.json(withUnread);
 });
 
 app.post('/api/chats/dm', (req, res) => {
@@ -189,6 +197,76 @@ app.post('/api/chats/group', (req, res) => {
 });
 
 app.get('/api/messages/:chatId', (req, res) => res.json(db.messages[req.params.chatId] || []));
+
+/* ---- リンクプレビュー ---- */
+
+const linkPreviewCache = new Map();
+
+function fetchHtml(targetUrl, redirectsLeft = 3) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(targetUrl); } catch { return reject(new Error('invalid url')); }
+    if (!['http:', 'https:'].includes(u.protocol)) return reject(new Error('unsupported protocol'));
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.get(u, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; HanabiLinkPreview/1.0)' }, timeout: 6000 }, (r) => {
+      if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location && redirectsLeft > 0) {
+        r.resume();
+        return fetchHtml(new URL(r.headers.location, u).toString(), redirectsLeft - 1).then(resolve, reject);
+      }
+      let data = '';
+      let received = 0;
+      r.on('data', (chunk) => {
+        received += chunk.length;
+        if (received > 300000) { req.destroy(); return; } // 300KBまで
+        data += chunk;
+      });
+      r.on('end', () => resolve(data));
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+}
+
+function extractMeta(html) {
+  const get = (re) => { const m = html.match(re); return m ? m[1].trim() : null; };
+  const ogTitle = get(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i)
+    || get(/<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:title["']/i);
+  const ogDesc = get(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i)
+    || get(/<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:description["']/i)
+    || get(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i);
+  const ogImage = get(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']*)["']/i)
+    || get(/<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:image["']/i);
+  const title = ogTitle || get(/<title[^>]*>([^<]*)<\/title>/i);
+  return { title, description: ogDesc, image: ogImage };
+}
+
+app.get('/api/link-preview', async (req, res) => {
+  const target = req.query.url;
+  if (!target || !/^https?:\/\//i.test(target)) return res.status(400).json({ error: 'invalid url' });
+  const cached = linkPreviewCache.get(target);
+  if (cached && Date.now() - cached.fetchedAt < 24 * 60 * 60 * 1000) return res.json(cached);
+  try {
+    const html = await fetchHtml(target);
+    const meta = extractMeta(html);
+    const u = new URL(target);
+    let image = null;
+    if (meta.image) { try { image = new URL(meta.image, target).toString(); } catch { image = null; } }
+    const result = {
+      title: meta.title || u.hostname,
+      description: meta.description || '',
+      image,
+      domain: u.hostname,
+      url: target,
+      fetchedAt: Date.now(),
+    };
+    linkPreviewCache.set(target, result);
+    res.json(result);
+  } catch {
+    const fallback = { title: null, description: null, image: null, domain: '', url: target, error: true, fetchedAt: Date.now() };
+    linkPreviewCache.set(target, fallback);
+    res.json(fallback);
+  }
+});
 
 /* ---- グループ管理 ---- */
 
@@ -358,6 +436,23 @@ io.on('connection', (socket) => {
         sendPushToUser(m, { title, body, url: '/', tag: `chat-${chatId}` });
       });
     }
+  });
+
+  socket.on('message:delete', ({ chatId, messageId, email }) => {
+    const list = db.messages[chatId];
+    if (!list) return;
+    const msg = list.find((m) => m.id === messageId);
+    if (!msg || msg.sender !== email || msg.deleted) return; // 本人のメッセージのみ削除可
+    msg.deleted = true;
+    msg.content = '';
+    msg.preview = 'メッセージを削除しました';
+    const chat = db.chats[chatId];
+    if (chat && chat.lastMessageTime === msg.ts) {
+      chat.lastMessage = 'メッセージを削除しました';
+    }
+    persist();
+    io.to(chatId).emit('message:deleted', { chatId, messageId });
+    if (chat) chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
   });
 
   // --- WebRTC signaling relay (音声・ビデオ通話) ---

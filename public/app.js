@@ -62,6 +62,7 @@ const api = {
   demoteAdmin: (chatId, data) => fetch(`/api/chats/${chatId}/admins/demote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
   vapidKey: () => fetch('/api/push/vapid-public-key').then((r) => r.json()),
   pushSubscribe: (data) => fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
+  linkPreview: (url) => fetch(`/api/link-preview?url=${encodeURIComponent(url)}`).then((r) => r.json()),
 };
 
 const state = {
@@ -73,6 +74,8 @@ const state = {
   socket: null,
   call: null,
   incomingCall: null,
+  replyingTo: null,
+  linkPreviews: {},
 };
 
 const appEl = document.getElementById('app');
@@ -188,9 +191,24 @@ function connectSocket() {
 
   socket.on('message:new', ({ chatId, message }) => {
     if (chatId === state.activeChatId) {
-      state.messages.push(message);
+      const exists = state.messages.some((m) => m.id === message.id);
+      if (!exists) state.messages.push(message);
       renderMessages();
       markChatRead(chatId);
+    } else {
+      const chat = state.chats.find((c) => c.id === chatId);
+      if (chat && message.sender !== state.user.email) {
+        chat.unreadCount = (chat.unreadCount || 0) + 1;
+        renderSidebarList();
+      }
+    }
+  });
+
+  socket.on('message:deleted', ({ chatId, messageId }) => {
+    if (chatId === state.activeChatId) {
+      const msg = state.messages.find((m) => m.id === messageId);
+      if (msg) { msg.deleted = true; msg.content = ''; msg.preview = 'メッセージを削除しました'; }
+      renderMessages();
     }
   });
 
@@ -286,6 +304,7 @@ function renderSidebarList() {
     const peer = c.type === 'dm' ? otherMember(c) : null;
     const title = c.type === 'group' ? c.name : (peer ? peer.name : '…');
     const av = c.type === 'group' ? { avatar: c.avatar, bg: '#2E3A59' } : peer;
+    const unread = c.unreadCount || 0;
     return `
       <div class="chat-row ${c.id === state.activeChatId ? 'active' : ''}" data-chat="${c.id}">
         ${avatarHTML(av, 46)}
@@ -294,7 +313,10 @@ function renderSidebarList() {
             <span class="chat-row-name">${esc(title)}</span>
             <span class="chat-row-time">${c.lastMessageTime ? fmtTime(c.lastMessageTime) : ''}</span>
           </div>
-          <div class="chat-row-preview">${esc(c.lastMessage || '新しいチャット')}</div>
+          <div class="chat-row-bottom">
+            <div class="chat-row-preview">${esc(c.lastMessage || '新しいチャット')}</div>
+            ${unread > 0 ? `<span class="unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}
+          </div>
         </div>
       </div>`;
   }).join('');
@@ -312,9 +334,11 @@ function renderMainEmpty() {
 
 async function openChat(chatId) {
   state.activeChatId = chatId;
+  state.replyingTo = null;
   state.socket.emit('chat:join', chatId);
-  renderSidebarList();
   const chat = state.chats.find((c) => c.id === chatId);
+  if (chat) chat.unreadCount = 0;
+  renderSidebarList();
   renderChatShell(chat);
   updateResponsiveLayout();
   state.messages = await api.messages(chatId);
@@ -348,6 +372,7 @@ function renderChatShell(chat) {
       </div>
       <div class="messages" id="messages"></div>
       <div id="sticker-panel"></div>
+      <div id="reply-bar" style="display:none"></div>
       <form class="composer" id="composer">
         <input type="file" id="file-input" accept="image/*" style="display:none" />
         <button type="button" class="icon-btn" id="btn-image">📷</button>
@@ -423,11 +448,17 @@ function renderMessages() {
     const sp = senderProfile(m.sender);
     const showRead = mine && i === lastReadIdx;
     const readLabel = showRead ? `<span class="read-label">${chat.type === 'group' ? `既読 ${lastReadCount}` : '既読'}</span>` : '';
+    const replyBlock = (!m.deleted && m.replyTo) ? `
+      <div class="reply-quote">
+        <div class="reply-quote-name">${esc(senderProfile(m.replyTo.sender).name)}</div>
+        <div class="reply-quote-text">${esc(m.replyTo.preview)}</div>
+      </div>` : '';
     html += `
-      <div class="msg-row ${mine ? 'mine' : ''}">
+      <div class="msg-row ${mine ? 'mine' : ''}" data-msg-id="${m.id}">
         ${!mine && chat.type === 'group' ? avatarHTML(sp, 26) : ''}
         <div class="msg-col ${mine ? 'mine' : 'theirs'}">
           ${!mine && chat.type === 'group' ? `<div class="msg-sender">${esc(sp.name)}</div>` : ''}
+          ${replyBlock}
           <div class="msg-line ${mine ? 'mine' : ''}">
             ${bubbleHTML(m, mine)}
             <span class="msg-time-col">${readLabel}<span class="msg-time">${fmtTime(m.ts)}</span></span>
@@ -437,20 +468,136 @@ function renderMessages() {
   });
   wrap.innerHTML = html;
   scrollToBottom();
+
+  wrap.querySelectorAll('.msg-row').forEach((row) => {
+    row.onclick = (e) => {
+      if (e.target.tagName === 'A') return; // リンクは通常通り開く
+      const msg = state.messages.find((mm) => mm.id === row.dataset.msgId);
+      if (msg && !msg.deleted) openMessageActions(msg);
+    };
+  });
+
+  attachLinkPreviews(chat);
+}
+
+function extractFirstUrl(text) {
+  const m = (text || '').match(/https?:\/\/[^\s<>"']+/i);
+  return m ? m[0] : null;
+}
+
+function linkify(escapedText, url) {
+  if (!url) return escapedText;
+  const escapedUrl = esc(url);
+  return escapedText.replace(escapedUrl, `<a href="${escapedUrl}" target="_blank" rel="noopener noreferrer">${escapedUrl}</a>`);
+}
+
+function attachLinkPreviews(chat) {
+  state.messages.forEach((m) => {
+    if (m.deleted || m.type !== 'text') return;
+    const url = extractFirstUrl(m.content);
+    if (!url) return;
+    const el = document.getElementById(`lp-${m.id}`);
+    if (!el) return;
+    const cached = state.linkPreviews[url];
+    if (cached) { renderLinkPreviewInto(el, cached); return; }
+    api.linkPreview(url).then((data) => {
+      state.linkPreviews[url] = data;
+      const target = document.getElementById(`lp-${m.id}`);
+      if (target) renderLinkPreviewInto(target, data);
+    }).catch(() => { const target = document.getElementById(`lp-${m.id}`); if (target) target.style.display = 'none'; });
+  });
+}
+
+function renderLinkPreviewInto(el, data) {
+  if (!data || data.error || (!data.title && !data.description && !data.image)) { el.style.display = 'none'; return; }
+  el.innerHTML = `
+    <a href="${esc(data.url)}" target="_blank" rel="noopener noreferrer" class="link-preview-inner">
+      ${data.image ? `<img src="${esc(data.image)}" alt="" class="link-preview-img" />` : ''}
+      <div class="link-preview-body">
+        <div class="link-preview-title">${esc(data.title || data.domain || '')}</div>
+        ${data.description ? `<div class="link-preview-desc">${esc(data.description)}</div>` : ''}
+        <div class="link-preview-domain">${esc(data.domain || '')}</div>
+      </div>
+    </a>`;
 }
 
 function bubbleHTML(m, mine) {
-  if (m.type === 'text') return `<div class="bubble ${mine ? 'mine' : 'theirs'}">${esc(m.content)}</div>`;
+  if (m.deleted) return `<div class="bubble deleted">メッセージを削除しました</div>`;
+  if (m.type === 'text') {
+    const url = extractFirstUrl(m.content);
+    const body = linkify(esc(m.content), url);
+    const preview = url ? `<div class="link-preview" id="lp-${m.id}">読み込み中…</div>` : '';
+    return `<div><div class="bubble ${mine ? 'mine' : 'theirs'}">${body}</div>${preview}</div>`;
+  }
   if (m.type === 'sticker') return `<div class="bubble sticker">${m.content}</div>`;
   if (m.type === 'image') return `<div class="bubble image ${mine ? 'mine' : 'theirs'}"><img src="${m.content}" alt="画像" /></div>`;
   return '';
 }
 
+/* ------------------------------- MESSAGE ACTIONS (返信・削除) ------------------------------- */
+
+function buildReplyPreview(msg) {
+  if (msg.type === 'sticker') return msg.content;
+  if (msg.type === 'image') return '📷 写真';
+  if (msg.deleted) return 'メッセージを削除しました';
+  return msg.content.length > 40 ? msg.content.slice(0, 40) + '…' : msg.content;
+}
+
+function openMessageActions(msg) {
+  const mine = msg.sender === state.user.email;
+  const overlay = openModal('メッセージ', '', false);
+  const body = document.getElementById('modal-body');
+  body.innerHTML = `
+    <button class="action-btn" id="action-reply">↩️ 返信する</button>
+    ${mine ? `<button class="action-btn danger" id="action-delete">🗑 削除する</button>` : ''}
+  `;
+  document.getElementById('action-reply').onclick = () => {
+    startReply(msg);
+    document.body.removeChild(overlay);
+  };
+  const delBtn = document.getElementById('action-delete');
+  if (delBtn) delBtn.onclick = () => {
+    if (!confirm('このメッセージを削除しますか？')) return;
+    state.socket.emit('message:delete', { chatId: state.activeChatId, messageId: msg.id, email: state.user.email });
+    document.body.removeChild(overlay);
+  };
+}
+
+function startReply(msg) {
+  state.replyingTo = { id: msg.id, sender: msg.sender, type: msg.type, preview: buildReplyPreview(msg) };
+  renderReplyBar();
+  const input = document.getElementById('text-input');
+  if (input) input.focus();
+}
+
+function cancelReply() {
+  state.replyingTo = null;
+  renderReplyBar();
+}
+
+function renderReplyBar() {
+  const bar = document.getElementById('reply-bar');
+  if (!bar) return;
+  if (!state.replyingTo) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  const sp = senderProfile(state.replyingTo.sender);
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <div class="reply-bar-inner">
+      <div class="reply-bar-name">${esc(sp.name)} に返信</div>
+      <div class="reply-bar-text">${esc(state.replyingTo.preview)}</div>
+    </div>
+    <button type="button" class="icon-btn" id="reply-cancel-btn">✕</button>`;
+  document.getElementById('reply-cancel-btn').onclick = cancelReply;
+}
+
 async function sendMessage(type, content, preview) {
   const message = { id: uid('m'), type, sender: state.user.email, content, preview, ts: Date.now() };
+  if (state.replyingTo) { message.replyTo = state.replyingTo; }
   state.messages.push(message);
   renderMessages();
   state.socket.emit('message:send', { chatId: state.activeChatId, message });
+  state.replyingTo = null;
+  renderReplyBar();
 }
 
 function handleSendText(e) {
