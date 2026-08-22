@@ -1,0 +1,17 @@
+{
+  "name": "Hanabi Chat",
+  "short_name": "Hanabi",
+  "description": "LINE風リアルタイムチャットアプリ",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1E7A5E",
+  "theme_color": "#1E7A5E",
+  "lang": "ja",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

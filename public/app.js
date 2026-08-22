@@ -646,10 +646,19 @@ function urlBase64ToUint8Array(base64String) {
   return outputArray;
 }
 
+// Service Workerはページ読み込み時に必ず登録する(PWAの「ホーム画面に追加」要件を満たすため。
+// プッシュ通知の許可有無とは切り離す)
+async function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return null;
+  try { return await navigator.serviceWorker.register('/sw.js'); }
+  catch (e) { console.warn('Service Workerの登録に失敗しました', e); return null; }
+}
+
 async function setupPush() {
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  if (!('PushManager' in window)) return;
   try {
-    const reg = await navigator.serviceWorker.register('/sw.js');
+    const reg = await registerServiceWorker();
+    if (!reg) return;
     const keyRes = await api.vapidKey();
     if (!keyRes.key) return; // サーバー側でVAPIDキー未設定
     let permission = Notification.permission;
@@ -1130,3 +1139,4 @@ function endCallLocal() {
 
 applyStoredTheme();
 renderLogin();
+registerServiceWorker();
