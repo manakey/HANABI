@@ -9,7 +9,7 @@ function applyStoredTheme() {
 applyStoredTheme();
 
 const AVATAR_EMOJIS = ['😀','😎','🐱','🐶','🐼','🦊','🐸','🦁','🐯','🐨','🦄','🐵','👽','🤖','👻','🎃','🌸','🍉','⚽','🎮','🎧','☕'];
-const AVATAR_COLORS = ['#1E7A5E','#FF6B4A','#4C6FFF','#F5A623','#B14CFF','#FF4C8B','#17A398','#2E3A59'];
+const AVATAR_COLORS = ['#06C755','#FF6B4A','#4C6FFF','#F5A623','#B14CFF','#FF4C8B','#00B900','#2E3A59'];
 const STICKERS = ['😀','😂','😍','😭','😡','👍','👎','🎉','❤️','🔥','👏','🙏','😴','🤔','😱','🥳','💯','✨','🍀','🌟','🐣','🍕'];
 const GROUP_ICONS = ['👥','🎉','🏠','💼','⭐','🍜'];
 
@@ -45,24 +45,47 @@ function compressImage(file, maxDim = 480, quality = 0.65) {
   });
 }
 
+// --- 認証トークン管理 ---
+function getToken() { return localStorage.getItem('hanabi-token'); }
+function setToken(t) { if (t) localStorage.setItem('hanabi-token', t); else localStorage.removeItem('hanabi-token'); }
+
+async function authFetch(url, options = {}) {
+  const token = getToken();
+  const headers = Object.assign({}, options.headers || {}, token ? { Authorization: `Bearer ${token}` } : {});
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401) {
+    // トークンが無効・期限切れ → ログイン画面に戻す
+    setToken(null);
+    state.user = null;
+    renderLogin();
+    throw new Error('認証切れ');
+  }
+  return res.json();
+}
+const jsonHeaders = { 'Content-Type': 'application/json' };
+
 const api = {
-  login: (email, name) => fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, name }) }).then((r) => r.json()),
-  directory: () => fetch('/api/directory').then((r) => r.json()),
-  profile: (data) => fetch('/api/profile', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  chats: (email) => fetch(`/api/chats/${encodeURIComponent(email)}`).then((r) => r.json()),
-  createDM: (a, b) => fetch('/api/chats/dm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ a, b }) }).then((r) => r.json()),
-  createGroup: (data) => fetch('/api/chats/group', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  messages: (chatId) => fetch(`/api/messages/${chatId}`).then((r) => r.json()),
-  upload: (file) => { const fd = new FormData(); fd.append('image', file); return fetch('/api/upload', { method: 'POST', body: fd }).then((r) => r.json()); },
-  renameGroup: (chatId, data) => fetch(`/api/chats/${chatId}/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  addMembers: (chatId, data) => fetch(`/api/chats/${chatId}/members/add`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  removeMember: (chatId, data) => fetch(`/api/chats/${chatId}/members/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  leaveGroup: (chatId, data) => fetch(`/api/chats/${chatId}/leave`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  promoteAdmin: (chatId, data) => fetch(`/api/chats/${chatId}/admins/promote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  demoteAdmin: (chatId, data) => fetch(`/api/chats/${chatId}/admins/demote`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
+  authCheck: (email) => fetch('/api/auth/check', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email }) }).then((r) => r.json()),
+  register: (email, name, password) => fetch('/api/register', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, name, password }) }).then((r) => r.json()),
+  login: (email, password) => fetch('/api/login', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, password }) }).then((r) => r.json()),
+  setPassword: (email, password) => fetch('/api/set-password', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, password }) }).then((r) => r.json()),
+  me: () => authFetch('/api/me'),
+  directory: () => authFetch('/api/directory'),
+  profile: (data) => authFetch('/api/profile', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify(data) }),
+  chats: (email) => authFetch(`/api/chats/${encodeURIComponent(email)}`),
+  createDM: (a, b) => authFetch('/api/chats/dm', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ a, b }) }),
+  createGroup: (data) => authFetch('/api/chats/group', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  messages: (chatId) => authFetch(`/api/messages/${chatId}`),
+  upload: (file) => { const fd = new FormData(); fd.append('image', file); return authFetch('/api/upload', { method: 'POST', body: fd }); },
+  renameGroup: (chatId, data) => authFetch(`/api/chats/${chatId}/rename`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  addMembers: (chatId, data) => authFetch(`/api/chats/${chatId}/members/add`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  removeMember: (chatId, data) => authFetch(`/api/chats/${chatId}/members/remove`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  leaveGroup: (chatId, data) => authFetch(`/api/chats/${chatId}/leave`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  promoteAdmin: (chatId, data) => authFetch(`/api/chats/${chatId}/admins/promote`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  demoteAdmin: (chatId, data) => authFetch(`/api/chats/${chatId}/admins/demote`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
   vapidKey: () => fetch('/api/push/vapid-public-key').then((r) => r.json()),
-  pushSubscribe: (data) => fetch('/api/push/subscribe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then((r) => r.json()),
-  linkPreview: (url) => fetch(`/api/link-preview?url=${encodeURIComponent(url)}`).then((r) => r.json()),
+  pushSubscribe: (data) => authFetch('/api/push/subscribe', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  linkPreview: (url) => authFetch(`/api/link-preview?url=${encodeURIComponent(url)}`),
 };
 
 const state = {
@@ -82,7 +105,7 @@ const appEl = document.getElementById('app');
 
 function avatarHTML(profile, size = 40) {
   if (!profile) return `<div class="avatar" style="width:${size}px;height:${size}px;background:#ddd"></div>`;
-  return `<div class="avatar" style="width:${size}px;height:${size}px;background:${profile.bg || '#1E7A5E'};font-size:${size * 0.55}px">${profile.avatar || '🙂'}</div>`;
+  return `<div class="avatar" style="width:${size}px;height:${size}px;background:${profile.bg || '#06C755'};font-size:${size * 0.55}px">${profile.avatar || '🙂'}</div>`;
 }
 
 /* ------------------------------- LOGIN ------------------------------- */
@@ -99,10 +122,17 @@ function renderLogin() {
         <div id="login-body"></div>
       </div>
     </div>`;
-  renderLoginStep1();
+  renderLoginEmailStep();
 }
 
-function renderLoginStep1() {
+function showLoginError(msg) {
+  const errEl = document.getElementById('login-error');
+  if (!errEl) return;
+  errEl.textContent = msg;
+  errEl.style.display = 'block';
+}
+
+function renderLoginEmailStep() {
   const body = document.getElementById('login-body');
   body.innerHTML = `
     <form id="login-form">
@@ -113,31 +143,85 @@ function renderLoginStep1() {
   document.getElementById('login-form').onsubmit = async (e) => {
     e.preventDefault();
     const email = document.getElementById('login-email').value.trim().toLowerCase();
-    const errEl = document.getElementById('login-error');
-    errEl.style.display = 'none';
     const btn = document.getElementById('login-submit');
     btn.disabled = true; btn.textContent = '確認中…';
-    const res = await api.login(email, '');
+    const res = await api.authCheck(email);
     btn.disabled = false; btn.textContent = '続ける';
-    if (res.error) { errEl.textContent = res.error; errEl.style.display = 'block'; return; }
-    if (res.needName) { renderLoginStep2(email); return; }
+    if (res.error) { showLoginError(res.error); return; }
+    if (!res.exists) renderSignupStep(email);
+    else if (!res.hasPassword) renderSetInitialPasswordStep(email);
+    else renderPasswordLoginStep(email);
+  };
+}
+
+function renderSignupStep(email) {
+  const body = document.getElementById('login-body');
+  body.innerHTML = `
+    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)} は新規アカウントです。表示名とパスワードを入力してください。</p>
+    <form id="login-form2">
+      <input class="field" id="signup-name" placeholder="表示名" autofocus required />
+      <input class="field" id="signup-password" type="password" placeholder="パスワード(6文字以上)" required minlength="6" />
+      <input class="field" id="signup-password2" type="password" placeholder="パスワード(確認)" required minlength="6" />
+      <div id="login-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" type="submit">アカウント作成してはじめる</button>
+    </form>
+    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+  document.getElementById('back-to-email').onclick = renderLoginEmailStep;
+  document.getElementById('login-form2').onsubmit = async (e) => {
+    e.preventDefault();
+    const name = document.getElementById('signup-name').value.trim();
+    const password = document.getElementById('signup-password').value;
+    const password2 = document.getElementById('signup-password2').value;
+    if (password !== password2) { showLoginError('パスワードが一致しません'); return; }
+    const res = await api.register(email, name, password);
+    if (res.error) { showLoginError(res.error); return; }
+    setToken(res.token);
     onLoggedIn(res.user);
   };
 }
 
-function renderLoginStep2(email) {
+function renderSetInitialPasswordStep(email) {
   const body = document.getElementById('login-body');
   body.innerHTML = `
-    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)} は新規アカウントです。表示名を入力してください。</p>
-    <form id="login-form2">
-      <input class="field" id="login-name" placeholder="表示名" autofocus required />
-      <button class="btn-primary" type="submit">アカウント作成してはじめる</button>
-    </form>`;
-  document.getElementById('login-form2').onsubmit = async (e) => {
+    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)} は以前パスワードなしで作られたアカウントです。安全のため、パスワードを設定してください。</p>
+    <form id="login-form3">
+      <input class="field" id="init-password" type="password" placeholder="パスワード(6文字以上)" autofocus required minlength="6" />
+      <input class="field" id="init-password2" type="password" placeholder="パスワード(確認)" required minlength="6" />
+      <div id="login-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" type="submit">パスワードを設定してログイン</button>
+    </form>
+    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+  document.getElementById('back-to-email').onclick = renderLoginEmailStep;
+  document.getElementById('login-form3').onsubmit = async (e) => {
     e.preventDefault();
-    const name = document.getElementById('login-name').value.trim();
-    const res = await api.login(email, name);
-    if (res.user) onLoggedIn(res.user);
+    const password = document.getElementById('init-password').value;
+    const password2 = document.getElementById('init-password2').value;
+    if (password !== password2) { showLoginError('パスワードが一致しません'); return; }
+    const res = await api.setPassword(email, password);
+    if (res.error) { showLoginError(res.error); return; }
+    setToken(res.token);
+    onLoggedIn(res.user);
+  };
+}
+
+function renderPasswordLoginStep(email) {
+  const body = document.getElementById('login-body');
+  body.innerHTML = `
+    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)}</p>
+    <form id="login-form4">
+      <input class="field" id="login-password" type="password" placeholder="パスワード" autofocus required />
+      <div id="login-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" type="submit">ログイン</button>
+    </form>
+    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+  document.getElementById('back-to-email').onclick = renderLoginEmailStep;
+  document.getElementById('login-form4').onsubmit = async (e) => {
+    e.preventDefault();
+    const password = document.getElementById('login-password').value;
+    const res = await api.login(email, password);
+    if (res.error) { showLoginError(res.error); return; }
+    setToken(res.token);
+    onLoggedIn(res.user);
   };
 }
 
@@ -147,6 +231,16 @@ async function onLoggedIn(user) {
   await Promise.all([loadDirectory(), loadChats()]);
   renderShell();
   setupPush();
+}
+
+// 起動時にトークンが残っていれば自動ログインを試みる
+async function tryAutoLogin() {
+  if (!getToken()) return false;
+  try {
+    const res = await api.me();
+    if (res && res.user) { await onLoggedIn(res.user); return true; }
+  } catch { /* トークン無効 → ログイン画面へフォールスルー(authFetch内で既にrenderLogin済み) */ }
+  return false;
 }
 
 /* ------------------------------- SOCKET ------------------------------- */
@@ -868,6 +962,7 @@ function openProfileModal() {
   };
   document.getElementById('profile-logout').onclick = () => {
     if (state.socket) state.socket.disconnect();
+    setToken(null);
     state.user = null; state.chats = []; state.messages = []; state.activeChatId = null;
     document.body.removeChild(overlay);
     renderLogin();
@@ -1034,7 +1129,7 @@ function renderIncomingCall() {
       <div style="font-size:13px;color:var(--text-dim);margin-bottom:6px">${data.video ? 'ビデオ通話の着信' : '音声通話の着信'}</div>
       <div class="incoming-actions">
         <button class="call-btn end" id="decline-btn">📵</button>
-        <button class="call-btn" id="accept-btn" style="background:#1E7A5E">📞</button>
+        <button class="call-btn" id="accept-btn" style="background:#06C755">📞</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
@@ -1138,5 +1233,5 @@ function endCallLocal() {
 /* ------------------------------- BOOT ------------------------------- */
 
 applyStoredTheme();
-renderLogin();
 registerServiceWorker();
+tryAutoLogin().then((loggedIn) => { if (!loggedIn) renderLogin(); });

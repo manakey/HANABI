@@ -13,9 +13,9 @@ input, select { font-family: inherit; }
   --text: #112233;
   --text-dim: #889;
   --border: #e6ece9;
-  --accent: #1E7A5E;
+  --accent: #06C755;
   --accent-contrast: #ffffff;
-  --bubble-mine-bg: #1E7A5E;
+  --bubble-mine-bg: #06C755;
   --bubble-mine-text: #ffffff;
   --bubble-theirs-bg: #ffffff;
   --bubble-theirs-text: #112233;
@@ -33,9 +33,9 @@ html.dark {
   --text: #edf3f1;
   --text-dim: #8fa39c;
   --border: #223130;
-  --accent: #2FAE83;
+  --accent: #06C755;
   --accent-contrast: #05130f;
-  --bubble-mine-bg: #227a5c;
+  --bubble-mine-bg: #05A648;
   --bubble-mine-text: #f2fbf7;
   --bubble-theirs-bg: #1b2628;
   --bubble-theirs-text: #edf3f1;
@@ -50,15 +50,16 @@ html.dark {
 /* ---- login ---- */
 .login-wrap {
   min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center;
-  background: linear-gradient(160deg,#0F3D33 0%,#1E7A5E 55%,#17A398 100%); padding: 20px;
+  background: linear-gradient(160deg,#03361f 0%,#06C755 55%,#3EE089 100%); padding: 20px;
 }
 .login-card { width: 360px; max-width: 100%; background: #fff; border-radius: 20px; padding: 36px 28px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
 .login-logo { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-.login-logo-icon { width: 40px; height: 40px; border-radius: 12px; background: #1E7A5E; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 20px; }
+.login-logo-icon { width: 40px; height: 40px; border-radius: 12px; background: #06C755; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 20px; }
 .login-title { font-size: 22px; font-weight: 800; color: #123; margin: 0; }
 .login-sub { color: #667; font-size: 13px; margin: 0 0 28px; }
 .field { width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 10px; border: 1.5px solid var(--input-border, #dde); font-size: 16px; margin-bottom: 10px; outline: none; background: var(--panel-bg, #fff); color: var(--text, #123); }
-.btn-primary { width: 100%; padding: 12px 0; border-radius: 10px; border: none; background: #1E7A5E; color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
+.btn-primary { width: 100%; padding: 12px 0; border-radius: 10px; border: none; background: #06C755; color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
+.link-btn { width: 100%; margin-top: 10px; background: none; border: none; color: #06C755; font-size: 13px; font-weight: 600; cursor: pointer; text-align: center; }
 .error-text { color: #d33; font-size: 12px; margin-bottom: 10px; }
 
 /* ---- shell ---- */

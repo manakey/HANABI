@@ -26,6 +26,8 @@ async function initSchema() {
       push_subscriptions JSONB NOT NULL DEFAULT '[]'::jsonb
     );
   `);
+  // 既存のテーブルにも password_hash 列を安全に追加する(パスワード認証機能の追加に伴う移行)
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS chats (
       id TEXT PRIMARY KEY,
@@ -111,12 +113,33 @@ async function getUser(email) {
   return mapUser(rows[0]);
 }
 
-async function createUser({ email, name, avatar, bg, createdAt }) {
+async function createUser({ email, name, avatar, bg, createdAt, passwordHash }) {
   const { rows } = await pool.query(
-    `INSERT INTO users (email, name, avatar, bg, created_at) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [email, name, avatar, bg, createdAt]
+    `INSERT INTO users (email, name, avatar, bg, created_at, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [email, name, avatar, bg, createdAt, passwordHash || null]
   );
   return mapUser(rows[0]);
+}
+
+// パスワードハッシュはmapUser()では絶対に返さない(公開APIレスポンスに漏れないようにするため専用関数を用意)
+async function getUserAuth(email) {
+  const { rows } = await pool.query('SELECT email, password_hash FROM users WHERE email=$1', [email]);
+  return rows[0] || null;
+}
+
+// 通常のパスワード変更(既にパスワードがあっても上書きする)
+async function setPassword(email, passwordHash) {
+  const { rows } = await pool.query('UPDATE users SET password_hash=$2 WHERE email=$1 RETURNING *', [email, passwordHash]);
+  return mapUser(rows[0]);
+}
+
+// 初回パスワード設定専用: 既にパスワードが設定されている場合は上書きしない(乗っ取り防止)
+async function setInitialPassword(email, passwordHash) {
+  const { rows } = await pool.query(
+    `UPDATE users SET password_hash=$2 WHERE email=$1 AND password_hash IS NULL RETURNING *`,
+    [email, passwordHash]
+  );
+  return rows[0] ? mapUser(rows[0]) : null;
 }
 
 async function updateUserProfile(email, { name, avatar, bg }) {
@@ -247,6 +270,7 @@ module.exports = {
   pool,
   initSchema,
   getUser, createUser, updateUserProfile, listUsers,
+  getUserAuth, setPassword, setInitialPassword,
   getPushSubscriptions, setPushSubscriptions, addPushSubscription, removePushSubscription,
   getChat, createChat, listChatIdsForUser, listChatsForUser, updateChatFields, setChatRead,
   addMessage, listMessages, softDeleteMessage,

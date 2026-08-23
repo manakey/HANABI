@@ -16,6 +16,8 @@ const { Readable } = require('stream');
 const { v4: uuidv4 } = require('uuid');
 const cloudinary = require('cloudinary').v2;
 const webpush = require('web-push');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const db = require('./db');
 
 const app = express();
@@ -75,12 +77,45 @@ async function sendPushToUser(email, payload) {
 }
 
 const AVATAR_EMOJIS = ['😀','😎','🐱','🐶','🐼','🦊','🐸','🦁','🐯','🐨','🦄','🐵','👽','🤖','👻','🎃','🌸','🍉','⚽','🎮'];
-const AVATAR_COLORS = ['#1E7A5E','#FF6B4A','#4C6FFF','#F5A623','#B14CFF','#FF4C8B','#17A398','#2E3A59'];
+const AVATAR_COLORS = ['#06C755','#FF6B4A','#4C6FFF','#F5A623','#B14CFF','#FF4C8B','#00B900','#2E3A59'];
+
+// --- 認証(パスワード + セッショントークン) ---
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  JWT_SECRET = require('crypto').randomBytes(32).toString('hex');
+  console.warn('[auth] JWT_SECRET が未設定です。今回はランダムな値で起動しますが、サーバー再起動のたびに全員が再ログインを求められます。環境変数 JWT_SECRET の設定を強く推奨します。');
+}
+const TOKEN_EXPIRY = '30d';
+
+function signToken(email) {
+  return jwt.sign({ email }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+}
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userEmail = payload.email;
+    next();
+  } catch {
+    res.status(401).json({ error: 'セッションが無効です。再度ログインしてください' });
+  }
+}
 
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use('/uploads', express.static(UPLOAD_DIR));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// --- ログイン不要で叩けるAPIのみ許可し、それ以外の /api/* は認証を必須にする ---
+const PUBLIC_API_PATHS = new Set(['/api/auth/check', '/api/register', '/api/login', '/api/set-password', '/api/push/vapid-public-key']);
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  if (PUBLIC_API_PATHS.has(req.path)) return next();
+  return authMiddleware(req, res, next);
+});
 
 const storage = USE_CLOUDINARY
   ? multer.memoryStorage()
@@ -100,32 +135,98 @@ function uploadBufferToCloudinary(buffer) {
   });
 }
 
-/* ------------------------------- REST API ------------------------------- */
+/* ------------------------------- 認証 ------------------------------- */
 
-app.post('/api/login', async (req, res) => {
-  const emailRaw = (req.body.email || '').trim().toLowerCase();
-  const name = (req.body.name || '').trim();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailRaw)) {
-    return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
-  }
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// メールアドレスの登録状況を確認(アカウント作成/ログイン/パスワード未設定 のどれに進むか判定するため)
+app.post('/api/auth/check', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
   try {
-    let user = await db.getUser(emailRaw);
-    if (!user) {
-      if (!name) return res.json({ needName: true });
-      user = await db.createUser({
-        email: emailRaw,
-        name,
-        avatar: AVATAR_EMOJIS[Math.floor(Math.random() * AVATAR_EMOJIS.length)],
-        bg: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
-        createdAt: Date.now(),
-      });
-    }
-    res.json({ user });
+    const auth = await db.getUserAuth(email);
+    res.json({ exists: !!auth, hasPassword: !!(auth && auth.password_hash) });
+  } catch (err) {
+    console.error('auth check error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+// 新規アカウント作成
+app.post('/api/register', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  const name = (req.body.name || '').trim();
+  const password = req.body.password || '';
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
+  if (!name) return res.status(400).json({ error: '表示名を入力してください' });
+  if (password.length < 6) return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
+  try {
+    const existing = await db.getUserAuth(email);
+    if (existing) return res.status(409).json({ error: 'このメールアドレスは既に登録されています' });
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await db.createUser({
+      email, name,
+      avatar: AVATAR_EMOJIS[Math.floor(Math.random() * AVATAR_EMOJIS.length)],
+      bg: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
+      createdAt: Date.now(),
+      passwordHash,
+    });
+    res.json({ user, token: signToken(email) });
+  } catch (err) {
+    console.error('register error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+// 既存アカウント(パスワード設定済み)でのログイン
+app.post('/api/login', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  const password = req.body.password || '';
+  try {
+    const auth = await db.getUserAuth(email);
+    if (!auth || !auth.password_hash) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+    const ok = await bcrypt.compare(password, auth.password_hash);
+    if (!ok) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+    const user = await db.getUser(email);
+    res.json({ user, token: signToken(email) });
   } catch (err) {
     console.error('login error:', err);
     res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
 });
+
+// パスワード導入前から使っていた既存アカウント向け: 初回のみパスワードを設定できる
+// (第三者による乗っ取り防止のため、既にパスワードが設定済みの場合はここでは変更させない)
+app.post('/api/set-password', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  const password = req.body.password || '';
+  if (password.length < 6) return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
+  try {
+    const auth = await db.getUserAuth(email);
+    if (!auth) return res.status(404).json({ error: 'アカウントが見つかりません' });
+    if (auth.password_hash) return res.status(409).json({ error: '既にパスワードが設定されています。ログインをご利用ください' });
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await db.setPassword(email, passwordHash);
+    res.json({ user, token: signToken(email) });
+  } catch (err) {
+    console.error('set-password error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+// トークンが有効かどうかの確認 + 自動ログイン用
+app.get('/api/me', async (req, res) => {
+  try {
+    const user = await db.getUser(req.userEmail);
+    if (!user) return res.status(404).json({ error: 'not found' });
+    res.json({ user });
+  } catch (err) {
+    console.error('me error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+/* ------------------------------- REST API ------------------------------- */
 
 app.get('/api/directory', async (req, res) => {
   try { res.json(await db.listUsers()); }
@@ -134,7 +235,7 @@ app.get('/api/directory', async (req, res) => {
 
 app.put('/api/profile', async (req, res) => {
   try {
-    const email = (req.body.email || '').toLowerCase();
+    const email = req.userEmail;
     const existing = await db.getUser(email);
     if (!existing) return res.status(404).json({ error: 'not found' });
     const user = await db.updateUserProfile(email, {
@@ -151,8 +252,9 @@ app.put('/api/profile', async (req, res) => {
 });
 
 app.get('/api/chats/:email', async (req, res) => {
+  if (req.params.email.toLowerCase() !== req.userEmail) return res.status(403).json({ error: '他のユーザーのチャット一覧は取得できません' });
   try {
-    res.json(await db.listChatsForUser(req.params.email.toLowerCase()));
+    res.json(await db.listChatsForUser(req.userEmail));
   } catch (err) {
     console.error('list chats error:', err);
     res.status(500).json([]);
@@ -161,7 +263,8 @@ app.get('/api/chats/:email', async (req, res) => {
 
 app.post('/api/chats/dm', async (req, res) => {
   try {
-    const members = [req.body.a, req.body.b].map((e) => e.toLowerCase()).sort();
+    const other = (req.body.a === req.userEmail ? req.body.b : req.body.a || req.body.b || '').toLowerCase();
+    const members = [req.userEmail, other].sort();
     const chatId = 'dm_' + members.join('__');
     let chat = await db.getChat(chatId);
     if (!chat) {
@@ -180,11 +283,12 @@ app.post('/api/chats/dm', async (req, res) => {
 
 app.post('/api/chats/group', async (req, res) => {
   try {
-    const { name, avatar, members, creator } = req.body;
+    const { name, avatar, members } = req.body;
+    const creator = req.userEmail;
     const chatId = 'group_' + uuidv4();
-    const allMembers = Array.from(new Set([creator.toLowerCase(), ...members.map((m) => m.toLowerCase())]));
+    const allMembers = Array.from(new Set([creator, ...(members || []).map((m) => m.toLowerCase())]));
     const chat = await db.createChat({
-      id: chatId, type: 'group', name, avatar, members: allMembers, admins: [creator.toLowerCase()], reads: {},
+      id: chatId, type: 'group', name, avatar, members: allMembers, admins: [creator], reads: {},
       createdAt: Date.now(), lastMessage: '', lastMessageTime: Date.now(),
     });
     allMembers.forEach((m) => io.to(`user:${m}`).emit('chat:new', chat));
@@ -196,8 +300,11 @@ app.post('/api/chats/group', async (req, res) => {
 });
 
 app.get('/api/messages/:chatId', async (req, res) => {
-  try { res.json(await db.listMessages(req.params.chatId)); }
-  catch (err) { console.error('list messages error:', err); res.status(500).json([]); }
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    if (!chat || !chat.members.includes(req.userEmail)) return res.status(403).json({ error: 'このチャットにアクセスできません' });
+    res.json(await db.listMessages(req.params.chatId));
+  } catch (err) { console.error('list messages error:', err); res.status(500).json([]); }
 });
 
 /* ---- リンクプレビュー ---- */
