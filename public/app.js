@@ -86,6 +86,9 @@ const api = {
   vapidKey: () => fetch('/api/push/vapid-public-key').then((r) => r.json()),
   pushSubscribe: (data) => authFetch('/api/push/subscribe', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
   linkPreview: (url) => authFetch(`/api/link-preview?url=${encodeURIComponent(url)}`),
+  toggleMute: (chatId) => authFetch(`/api/chats/${chatId}/mute`, { method: 'POST' }),
+  block: (targetEmail) => authFetch('/api/block', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ targetEmail }) }),
+  unblock: (targetEmail) => authFetch('/api/unblock', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ targetEmail }) }),
 };
 
 const state = {
@@ -99,9 +102,13 @@ const state = {
   incomingCall: null,
   replyingTo: null,
   linkPreviews: {},
+  groupCall: null,
 };
 
 const appEl = document.getElementById('app');
+
+function isMuted(chatId) { return (state.user.mutedChats || []).includes(chatId); }
+function isBlockedUser(email) { return (state.user.blockedUsers || []).includes(email); }
 
 function avatarHTML(profile, size = 40) {
   if (!profile) return `<div class="avatar" style="width:${size}px;height:${size}px;background:#ddd"></div>`;
@@ -320,6 +327,31 @@ function connectSocket() {
   socket.on('call:ice-candidate', (data) => { if (state.call && state.call.callId === data.callId) handleRemoteIce(data); });
   socket.on('call:ended', (data) => { if (state.call && state.call.callId === data.callId) endCallLocal(); });
   socket.on('call:declined', (data) => { if (state.call && state.call.callId === data.callId) { setCallStatus('相手が応答しませんでした'); setTimeout(endCallLocal, 1200); } });
+
+  socket.on('message:blocked', ({ chatId }) => {
+    if (chatId === state.activeChatId) {
+      state.messages = state.messages.slice(0, -1); // 楽観的に表示した送信メッセージを取り消す
+      renderMessages();
+      alert('相手をブロックしているか、相手にブロックされているため送信できませんでした');
+    }
+  });
+
+  // --- グループ通話 ---
+  socket.on('group-call:incoming', (data) => {
+    if (state.groupCall) return; // 既に別の通話中なら無視(簡易対応)
+    showIncomingGroupCallBanner(data);
+  });
+  socket.on('group-call:peer-joined', ({ chatId, email }) => {
+    if (!state.groupCall || state.groupCall.chatId !== chatId) return;
+    connectToGroupPeer(email, false); // 相手からのofferを待つ
+  });
+  socket.on('group-call:signal', (data) => handleGroupCallSignal(data));
+  socket.on('group-call:peer-left', ({ chatId, email }) => {
+    if (!state.groupCall || state.groupCall.chatId !== chatId) return;
+    const pc = groupPeers.get(email);
+    if (pc) { pc.close(); groupPeers.delete(email); }
+    removeGroupCallTile(email);
+  });
 }
 
 async function loadDirectory() { state.directory = await api.directory(); }
@@ -463,6 +495,10 @@ function renderChatShell(chat) {
         ${chat.type === 'dm' && peer ? `
           <button class="icon-btn" id="btn-call-audio" title="音声通話">📞</button>
           <button class="icon-btn" id="btn-call-video" title="ビデオ通話">🎥</button>` : ''}
+        ${chat.type === 'group' ? `
+          <button class="icon-btn" id="btn-group-call-audio" title="グループ音声通話">📞</button>
+          <button class="icon-btn" id="btn-group-call-video" title="グループビデオ通話">🎥</button>` : ''}
+        <button class="icon-btn" id="btn-chat-menu" title="その他">⋮</button>
       </div>
       <div class="messages" id="messages"></div>
       <div id="sticker-panel"></div>
@@ -489,10 +525,46 @@ function renderChatShell(chat) {
     document.getElementById('btn-call-audio').onclick = () => startCall(peer, false);
     document.getElementById('btn-call-video').onclick = () => startCall(peer, true);
   }
+  if (chat.type === 'group') {
+    document.getElementById('btn-group-call-audio').onclick = () => startGroupCall(chat, false);
+    document.getElementById('btn-group-call-video').onclick = () => startGroupCall(chat, true);
+  }
+  document.getElementById('btn-chat-menu').onclick = () => openChatMenu(chat, peer);
   document.getElementById('btn-image').onclick = () => document.getElementById('file-input').click();
   document.getElementById('file-input').onchange = handleImagePick;
   document.getElementById('btn-sticker').onclick = toggleStickerPanel;
   document.getElementById('composer').onsubmit = handleSendText;
+}
+
+function openChatMenu(chat, peer) {
+  const muted = isMuted(chat.id);
+  const blocked = peer ? isBlockedUser(peer.email) : false;
+  const overlay = openModal('チャットの設定', '', false);
+  const body = overlay.bodyEl;
+  body.innerHTML = `
+    <button class="action-btn" id="menu-mute">${muted ? '🔔 通知をオンにする' : '🔕 通知をオフにする'}</button>
+    ${chat.type === 'group' ? `<button class="action-btn" id="menu-group-info">👥 グループ情報</button>` : ''}
+    ${chat.type === 'dm' && peer ? `<button class="action-btn danger" id="menu-block">${blocked ? 'ブロックを解除する' : '🚫 ブロックする'}</button>` : ''}
+  `;
+  document.getElementById('menu-mute').onclick = async () => {
+    const res = await api.toggleMute(chat.id);
+    state.user.mutedChats = res.mutedChats;
+    document.body.removeChild(overlay);
+  };
+  const groupInfoBtn = document.getElementById('menu-group-info');
+  if (groupInfoBtn) groupInfoBtn.onclick = () => { document.body.removeChild(overlay); openGroupInfoModal(chat.id); };
+  const blockBtn = document.getElementById('menu-block');
+  if (blockBtn) blockBtn.onclick = async () => {
+    if (blocked) {
+      const res = await api.unblock(peer.email);
+      state.user.blockedUsers = res.blockedUsers;
+    } else {
+      if (!confirm(`${peer.name}さんをブロックしますか？ブロックすると、お互いにメッセージやチャット作成ができなくなります。`)) return;
+      const res = await api.block(peer.email);
+      state.user.blockedUsers = res.blockedUsers;
+    }
+    document.body.removeChild(overlay);
+  };
 }
 
 function updateChatHeaderIfActive(chat) {
@@ -869,7 +941,7 @@ function isAdminClient(chat) { return chat.type === 'group' && Array.isArray(cha
 
 function openAddMembersModal(parentChatId, onDone) {
   const chat = currentChatById(parentChatId);
-  const candidates = state.directory.filter((u) => u.email !== state.user.email && !chat.members.includes(u.email));
+  const candidates = state.directory.filter((u) => u.email !== state.user.email && !chat.members.includes(u.email) && !isBlockedUser(u.email));
   const selected = new Set();
   const overlay = openModal('メンバーを追加', '', true);
   const body = overlay.bodyEl;
@@ -975,7 +1047,7 @@ function openNewChatModal() {
   let mode = 'dm';
   let selected = new Set();
   let groupAvatar = GROUP_ICONS[0];
-  const others = state.directory.filter((u) => u.email !== state.user.email);
+  const others = state.directory.filter((u) => u.email !== state.user.email && !isBlockedUser(u.email));
 
   const overlay = openModal('新しいチャット', '', true);
   const body = overlay.bodyEl;
@@ -1228,6 +1300,189 @@ function endCallLocal() {
   const overlay = document.getElementById('call-overlay');
   if (overlay) overlay.remove();
   state.call = null;
+}
+
+/* ------------------------------- GROUP CALLS (WebRTCメッシュ) ------------------------------- */
+
+let groupLocalStream = null;
+const groupPeers = new Map(); // email -> RTCPeerConnection
+
+function groupTileId(email) { return `gc-tile-${email.replace(/[^a-zA-Z0-9]/g, '_')}`; }
+
+async function startGroupCall(chat, video) {
+  state.socket.emit('group-call:start', { chatId: chat.id, video }, (res) => {
+    if (!res || res.error) { alert('通話を開始できませんでした'); return; }
+    enterGroupCallUI(chat, res.callId, res.video, res.participants);
+  });
+}
+
+function showIncomingGroupCallBanner(data) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'incoming-group-call-overlay';
+  overlay.innerHTML = `
+    <div class="incoming-call-card">
+      ${avatarHTML({ avatar: data.chatAvatar || '👥', bg: '#2E3A59' }, 64)}
+      <div style="font-weight:800;font-size:16px;margin-top:12px;color:var(--text)">${esc(data.chatName)}</div>
+      <div style="font-size:13px;color:var(--text-dim);margin-bottom:6px">${esc(data.fromName)}さんがグループ${data.video ? 'ビデオ' : '音声'}通話を開始しました</div>
+      <div class="incoming-actions">
+        <button class="call-btn end" id="gc-decline-btn">📵</button>
+        <button class="call-btn" id="gc-accept-btn" style="background:#06C755">📞</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  document.getElementById('gc-decline-btn').onclick = () => document.body.removeChild(overlay);
+  document.getElementById('gc-accept-btn').onclick = () => {
+    document.body.removeChild(overlay);
+    state.socket.emit('group-call:join', { chatId: data.chatId }, (res) => {
+      if (!res || res.error) return;
+      const chat = currentChatById(data.chatId) || { id: data.chatId, name: data.chatName, avatar: data.chatAvatar, type: 'group' };
+      enterGroupCallUI(chat, res.callId, res.video, res.participants);
+    });
+  };
+}
+
+async function enterGroupCallUI(chat, callId, video, existingParticipants) {
+  state.groupCall = { chatId: chat.id, callId, video, micOn: true, camOn: !!video };
+  renderGroupCallOverlay(chat);
+  try {
+    groupLocalStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: !!video });
+  } catch {
+    alert('マイク／カメラを利用できません');
+    leaveGroupCall();
+    return;
+  }
+  addLocalGroupTile(video);
+  for (const email of existingParticipants) {
+    await connectToGroupPeer(email, true); // 自分が新規参加者側なのでofferを送る
+  }
+}
+
+function makeGroupPeerConnection(email) {
+  const conn = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  groupLocalStream.getTracks().forEach((t) => conn.addTrack(t, groupLocalStream));
+  conn.onicecandidate = (e) => {
+    if (e.candidate) {
+      state.socket.emit('group-call:signal', {
+        chatId: state.groupCall.chatId, toEmail: email, fromEmail: state.user.email,
+        type: 'ice', payload: e.candidate.toJSON(),
+      });
+    }
+  };
+  conn.ontrack = (e) => setGroupRemoteTile(email, e.streams[0]);
+  groupPeers.set(email, conn);
+  return conn;
+}
+
+async function connectToGroupPeer(email, isOfferer) {
+  if (groupPeers.has(email)) return;
+  addGroupPeerTile(email);
+  const conn = makeGroupPeerConnection(email);
+  if (isOfferer) {
+    const offer = await conn.createOffer();
+    await conn.setLocalDescription(offer);
+    state.socket.emit('group-call:signal', {
+      chatId: state.groupCall.chatId, toEmail: email, fromEmail: state.user.email,
+      type: 'offer', payload: { type: offer.type, sdp: offer.sdp },
+    });
+  }
+}
+
+async function handleGroupCallSignal({ chatId, fromEmail, type, payload }) {
+  if (!state.groupCall || state.groupCall.chatId !== chatId) return;
+  let conn = groupPeers.get(fromEmail);
+  if (!conn) { addGroupPeerTile(fromEmail); conn = makeGroupPeerConnection(fromEmail); }
+  if (type === 'offer') {
+    await conn.setRemoteDescription(new RTCSessionDescription(payload));
+    const answer = await conn.createAnswer();
+    await conn.setLocalDescription(answer);
+    state.socket.emit('group-call:signal', {
+      chatId, toEmail: fromEmail, fromEmail: state.user.email,
+      type: 'answer', payload: { type: answer.type, sdp: answer.sdp },
+    });
+  } else if (type === 'answer') {
+    await conn.setRemoteDescription(new RTCSessionDescription(payload));
+  } else if (type === 'ice') {
+    try { await conn.addIceCandidate(new RTCIceCandidate(payload)); } catch { /* ignore */ }
+  }
+}
+
+function renderGroupCallOverlay(chat) {
+  const div = document.createElement('div');
+  div.className = 'call-overlay';
+  div.id = 'group-call-overlay';
+  div.innerHTML = `
+    <div class="gc-header">${esc(chat.name || 'グループ通話')}</div>
+    <div class="gc-grid" id="group-call-tiles"></div>
+    <div class="call-controls">
+      <button class="call-btn" id="gc-mic-btn">🎤</button>
+      ${state.groupCall.video ? '<button class="call-btn" id="gc-cam-btn">📷</button>' : ''}
+      <button class="call-btn end" id="gc-leave-btn">📵</button>
+    </div>`;
+  document.body.appendChild(div);
+  document.getElementById('gc-mic-btn').onclick = () => {
+    state.groupCall.micOn = !state.groupCall.micOn;
+    groupLocalStream.getAudioTracks().forEach((t) => t.enabled = state.groupCall.micOn);
+    document.getElementById('gc-mic-btn').textContent = state.groupCall.micOn ? '🎤' : '🔇';
+  };
+  const camBtn = document.getElementById('gc-cam-btn');
+  if (camBtn) camBtn.onclick = () => {
+    state.groupCall.camOn = !state.groupCall.camOn;
+    groupLocalStream.getVideoTracks().forEach((t) => t.enabled = state.groupCall.camOn);
+    camBtn.textContent = state.groupCall.camOn ? '📷' : '🚫';
+  };
+  document.getElementById('gc-leave-btn').onclick = leaveGroupCall;
+}
+
+function addLocalGroupTile(video) {
+  const grid = document.getElementById('group-call-tiles');
+  if (!grid) return;
+  const div = document.createElement('div');
+  div.className = 'gc-tile';
+  div.id = groupTileId(state.user.email);
+  div.innerHTML = video
+    ? `<video autoplay playsinline muted class="gc-video"></video><div class="gc-name">${esc(state.user.name)}(自分)</div>`
+    : `<div class="gc-avatar">${avatarHTML(state.user, 64)}</div><div class="gc-name">${esc(state.user.name)}(自分)</div>`;
+  grid.appendChild(div);
+  if (video) div.querySelector('video').srcObject = groupLocalStream;
+}
+
+function addGroupPeerTile(email) {
+  const grid = document.getElementById('group-call-tiles');
+  if (!grid || document.getElementById(groupTileId(email))) return;
+  const profile = senderProfile(email);
+  const div = document.createElement('div');
+  div.className = 'gc-tile';
+  div.id = groupTileId(email);
+  div.innerHTML = `<div class="gc-avatar">${avatarHTML(profile, 64)}</div><video autoplay playsinline class="gc-video" style="display:none"></video><div class="gc-name">${esc(profile.name)}</div>`;
+  grid.appendChild(div);
+}
+
+function setGroupRemoteTile(email, stream) {
+  const tile = document.getElementById(groupTileId(email));
+  if (!tile) return;
+  const video = tile.querySelector('video');
+  const avatarDiv = tile.querySelector('.gc-avatar');
+  video.srcObject = stream;
+  if (stream.getVideoTracks().length > 0) {
+    video.style.display = 'block';
+    if (avatarDiv) avatarDiv.style.display = 'none';
+  }
+}
+
+function removeGroupCallTile(email) {
+  const tile = document.getElementById(groupTileId(email));
+  if (tile) tile.remove();
+}
+
+function leaveGroupCall() {
+  if (state.groupCall) state.socket.emit('group-call:leave', { chatId: state.groupCall.chatId });
+  groupPeers.forEach((conn) => { try { conn.close(); } catch {} });
+  groupPeers.clear();
+  if (groupLocalStream) { groupLocalStream.getTracks().forEach((t) => t.stop()); groupLocalStream = null; }
+  const overlay = document.getElementById('group-call-overlay');
+  if (overlay) overlay.remove();
+  state.groupCall = null;
 }
 
 /* ------------------------------- BOOT ------------------------------- */

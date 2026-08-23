@@ -28,6 +28,9 @@ async function initSchema() {
   `);
   // 既存のテーブルにも password_hash 列を安全に追加する(パスワード認証機能の追加に伴う移行)
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;`);
+  // ミュート設定・ブロックリスト用の列
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS muted_chats JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_users JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS chats (
       id TEXT PRIMARY KEY,
@@ -70,6 +73,8 @@ function mapUser(row) {
     bg: row.bg,
     createdAt: Number(row.created_at),
     pushSubscriptions: row.push_subscriptions || [],
+    mutedChats: row.muted_chats || [],
+    blockedUsers: row.blocked_users || [],
   };
 }
 
@@ -177,6 +182,52 @@ async function removePushSubscription(email, endpoint) {
   await setPushSubscriptions(email, subs.filter((s) => s.endpoint !== endpoint));
 }
 
+/* ---------------- ミュート設定 ---------------- */
+
+async function getMutedChats(email) {
+  const { rows } = await pool.query('SELECT muted_chats FROM users WHERE email=$1', [email]);
+  return rows[0] ? (rows[0].muted_chats || []) : [];
+}
+
+async function toggleMuteChat(email, chatId) {
+  const list = await getMutedChats(email);
+  const idx = list.indexOf(chatId);
+  if (idx >= 0) list.splice(idx, 1); else list.push(chatId);
+  await pool.query('UPDATE users SET muted_chats=$2 WHERE email=$1', [email, JSON.stringify(list)]);
+  return list;
+}
+
+async function isChatMuted(email, chatId) {
+  const list = await getMutedChats(email);
+  return list.includes(chatId);
+}
+
+/* ---------------- ブロック ---------------- */
+
+async function getBlockedUsers(email) {
+  const { rows } = await pool.query('SELECT blocked_users FROM users WHERE email=$1', [email]);
+  return rows[0] ? (rows[0].blocked_users || []) : [];
+}
+
+async function blockUser(email, targetEmail) {
+  const list = await getBlockedUsers(email);
+  if (!list.includes(targetEmail)) list.push(targetEmail);
+  await pool.query('UPDATE users SET blocked_users=$2 WHERE email=$1', [email, JSON.stringify(list)]);
+  return list;
+}
+
+async function unblockUser(email, targetEmail) {
+  const list = (await getBlockedUsers(email)).filter((e) => e !== targetEmail);
+  await pool.query('UPDATE users SET blocked_users=$2 WHERE email=$1', [email, JSON.stringify(list)]);
+  return list;
+}
+
+// どちらか一方がブロックしていれば true (双方向で無効化するため)
+async function isBlocked(emailA, emailB) {
+  const [a, b] = await Promise.all([getBlockedUsers(emailA), getBlockedUsers(emailB)]);
+  return a.includes(emailB) || b.includes(emailA);
+}
+
 /* ---------------- chats ---------------- */
 
 async function getChat(chatId) {
@@ -272,6 +323,8 @@ module.exports = {
   getUser, createUser, updateUserProfile, listUsers,
   getUserAuth, setPassword, setInitialPassword,
   getPushSubscriptions, setPushSubscriptions, addPushSubscription, removePushSubscription,
+  getMutedChats, toggleMuteChat, isChatMuted,
+  getBlockedUsers, blockUser, unblockUser, isBlocked,
   getChat, createChat, listChatIdsForUser, listChatsForUser, updateChatFields, setChatRead,
   addMessage, listMessages, softDeleteMessage,
 };

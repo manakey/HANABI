@@ -264,6 +264,9 @@ app.get('/api/chats/:email', async (req, res) => {
 app.post('/api/chats/dm', async (req, res) => {
   try {
     const other = (req.body.a === req.userEmail ? req.body.b : req.body.a || req.body.b || '').toLowerCase();
+    if (await db.isBlocked(req.userEmail, other)) {
+      return res.status(403).json({ error: 'ブロック中のためチャットを開始できません' });
+    }
     const members = [req.userEmail, other].sort();
     const chatId = 'dm_' + members.join('__');
     let chat = await db.getChat(chatId);
@@ -521,6 +524,43 @@ app.post('/api/push/unsubscribe', async (req, res) => {
   }
 });
 
+/* ---- チャットのミュート設定 ---- */
+
+app.post('/api/chats/:chatId/mute', async (req, res) => {
+  try {
+    const mutedChats = await db.toggleMuteChat(req.userEmail, req.params.chatId);
+    res.json({ mutedChats });
+  } catch (err) {
+    console.error('mute toggle error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+/* ---- ブロック ---- */
+
+app.post('/api/block', async (req, res) => {
+  try {
+    const target = (req.body.targetEmail || '').toLowerCase();
+    if (!target || target === req.userEmail) return res.status(400).json({ error: 'invalid target' });
+    const blockedUsers = await db.blockUser(req.userEmail, target);
+    res.json({ blockedUsers });
+  } catch (err) {
+    console.error('block error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.post('/api/unblock', async (req, res) => {
+  try {
+    const target = (req.body.targetEmail || '').toLowerCase();
+    const blockedUsers = await db.unblockUser(req.userEmail, target);
+    res.json({ blockedUsers });
+  } catch (err) {
+    console.error('unblock error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
 app.post('/api/upload', upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'no file' });
   if (USE_CLOUDINARY) {
@@ -538,6 +578,9 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
 app.get('/healthz', (req, res) => res.send('ok'));
 
 /* ------------------------------- Socket.IO ------------------------------- */
+
+// グループ通話の状態はメモリ上で管理(chatId -> { callId, video, participants: Set<email> })
+const activeGroupCalls = new Map();
 
 io.on('connection', (socket) => {
   let currentEmail = null;
@@ -563,19 +606,28 @@ io.on('connection', (socket) => {
 
   socket.on('message:send', async ({ chatId, message }) => {
     try {
+      const targetChat = await db.getChat(chatId);
+      if (targetChat && targetChat.type === 'dm') {
+        const other = targetChat.members.find((m) => m !== message.sender);
+        if (other && await db.isBlocked(message.sender, other)) {
+          socket.emit('message:blocked', { chatId });
+          return;
+        }
+      }
       await db.addMessage(chatId, message);
       const chat = await db.updateChatFields(chatId, { lastMessage: message.preview, lastMessageTime: message.ts });
       io.to(chatId).emit('message:new', { chatId, message });
       if (chat) {
         chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', chat));
-        // オフライン/バックグラウンドのメンバーへプッシュ通知
+        // オフライン/バックグラウンドのメンバーへプッシュ通知(ミュート中のメンバーには送らない)
         const sender = await db.getUser(message.sender);
         const senderName = sender ? sender.name : message.sender;
         const title = chat.type === 'group' ? chat.name : senderName;
         const body = chat.type === 'group' ? `${senderName}: ${message.preview}` : message.preview;
-        chat.members.filter((m) => m !== message.sender).forEach((m) => {
-          sendPushToUser(m, { title, body, url: '/', tag: `chat-${chatId}` });
-        });
+        for (const m of chat.members.filter((mm) => mm !== message.sender)) {
+          const muted = await db.isChatMuted(m, chatId);
+          if (!muted) sendPushToUser(m, { title, body, url: '/', tag: `chat-${chatId}` });
+        }
       }
     } catch (err) { console.error('message:send error:', err); }
   });
@@ -593,7 +645,7 @@ io.on('connection', (socket) => {
     } catch (err) { console.error('message:delete error:', err); }
   });
 
-  // --- WebRTC signaling relay (音声・ビデオ通話) ---
+  // --- WebRTC signaling relay (1対1 音声・ビデオ通話) ---
   socket.on('call:invite', async (data) => {
     io.to(`user:${data.toEmail}`).emit('call:incoming', data);
     try {
@@ -610,7 +662,74 @@ io.on('connection', (socket) => {
   socket.on('call:end', (data) => io.to(`user:${data.toEmail}`).emit('call:ended', data));
   socket.on('call:decline', (data) => io.to(`user:${data.toEmail}`).emit('call:declined', data));
 
-  socket.on('disconnect', () => {});
+  // --- グループ通話 (WebRTCメッシュ構成、Socket.IOでシグナリング中継) ---
+  socket.on('group-call:start', async ({ chatId, video }, callback) => {
+    try {
+      const chat = await db.getChat(chatId);
+      if (!chat || chat.type !== 'group' || !currentEmail) { if (callback) callback({ error: 'not found' }); return; }
+      let call = activeGroupCalls.get(chatId);
+      if (!call) { call = { callId: uuidv4(), video: !!video, participants: new Set() }; activeGroupCalls.set(chatId, call); }
+      const roomName = `callroom:${chatId}`;
+      const existing = Array.from(call.participants);
+      call.participants.add(currentEmail);
+      socket.join(roomName);
+      socket.to(roomName).emit('group-call:peer-joined', { chatId, email: currentEmail });
+      if (callback) callback({ callId: call.callId, video: call.video, participants: existing });
+
+      const starter = await db.getUser(currentEmail);
+      chat.members.filter((m) => m !== currentEmail && !call.participants.has(m)).forEach((m) => {
+        io.to(`user:${m}`).emit('group-call:incoming', {
+          chatId, callId: call.callId, video: call.video,
+          chatName: chat.name, chatAvatar: chat.avatar,
+          fromEmail: currentEmail, fromName: starter ? starter.name : currentEmail,
+        });
+        db.isChatMuted(m, chatId).then((muted) => {
+          if (!muted) sendPushToUser(m, { title: chat.name, body: `${starter ? starter.name : currentEmail} がグループ通話を開始しました`, url: '/', tag: `groupcall-${chatId}` });
+        });
+      });
+    } catch (err) {
+      console.error('group-call:start error:', err);
+      if (callback) callback({ error: 'server error' });
+    }
+  });
+
+  socket.on('group-call:join', ({ chatId }, callback) => {
+    try {
+      if (!currentEmail) { if (callback) callback({ error: 'not authed' }); return; }
+      const call = activeGroupCalls.get(chatId);
+      if (!call) { if (callback) callback({ error: 'no active call' }); return; }
+      const roomName = `callroom:${chatId}`;
+      const existing = Array.from(call.participants);
+      call.participants.add(currentEmail);
+      socket.join(roomName);
+      socket.to(roomName).emit('group-call:peer-joined', { chatId, email: currentEmail });
+      if (callback) callback({ callId: call.callId, video: call.video, participants: existing });
+    } catch (err) {
+      console.error('group-call:join error:', err);
+      if (callback) callback({ error: 'server error' });
+    }
+  });
+
+  // offer/answer/ice candidateを相手ユーザーへ中継するだけ(P2Pメッシュなので実データは通らない)
+  socket.on('group-call:signal', (data) => {
+    io.to(`user:${data.toEmail}`).emit('group-call:signal', data);
+  });
+
+  function leaveGroupCallRoom(chatId) {
+    const call = activeGroupCalls.get(chatId);
+    if (!call || !currentEmail) return;
+    call.participants.delete(currentEmail);
+    socket.leave(`callroom:${chatId}`);
+    socket.to(`callroom:${chatId}`).emit('group-call:peer-left', { chatId, email: currentEmail });
+    if (call.participants.size === 0) activeGroupCalls.delete(chatId);
+  }
+
+  socket.on('group-call:leave', ({ chatId }) => leaveGroupCallRoom(chatId));
+
+  socket.on('disconnect', () => {
+    if (!currentEmail) return;
+    for (const chatId of activeGroupCalls.keys()) leaveGroupCallRoom(chatId);
+  });
 });
 
 // SPA フォールバック

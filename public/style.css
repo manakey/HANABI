@@ -185,6 +185,14 @@ html.dark {
 .incoming-call-card { background: var(--modal-bg); border-radius: 18px; padding: 28px; width: 300px; max-width: 100%; text-align: center; }
 .incoming-actions { display: flex; gap: 12px; justify-content: center; margin-top: 20px; }
 
+/* ---- グループ通話 ---- */
+.gc-header { color: #fff; text-align: center; padding: 20px 16px 4px; font-weight: 700; font-size: 16px; }
+.gc-grid { flex: 1; display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; padding: 16px; align-content: center; overflow-y: auto; }
+.gc-tile { position: relative; background: #16211f; border-radius: 14px; aspect-ratio: 4/3; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.gc-video { width: 100%; height: 100%; object-fit: cover; }
+.gc-avatar { display: flex; align-items: center; justify-content: center; }
+.gc-name { position: absolute; bottom: 6px; left: 8px; color: #fff; font-size: 11.5px; background: rgba(0,0,0,0.4); padding: 2px 8px; border-radius: 8px; }
+
 /* ---- モバイル対応 ---- */
 @media (max-width: 720px) {
   .sidebar { width: 100%; }
