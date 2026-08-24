@@ -645,46 +645,48 @@ io.on('connection', (socket) => {
     } catch (err) { console.error('message:delete error:', err); }
   });
 
-  // --- WebRTC signaling relay (1対1 音声・ビデオ通話) ---
+  // --- WebRTC signaling relay (1対1 通話。マイク/カメラは通話中いつでも切替可能) ---
   socket.on('call:invite', async (data) => {
     io.to(`user:${data.toEmail}`).emit('call:incoming', data);
     try {
       const caller = await db.getUser(data.fromEmail);
       sendPushToUser(data.toEmail, {
         title: `${caller ? caller.name : data.fromEmail} から着信`,
-        body: data.video ? 'ビデオ通話の着信です' : '音声通話の着信です',
+        body: '着信です',
         url: '/', tag: 'call',
       });
     } catch (err) { console.error('call push error:', err); }
   });
   socket.on('call:answer', (data) => io.to(`user:${data.toEmail}`).emit('call:answered', data));
   socket.on('call:ice-candidate', (data) => io.to(`user:${data.toEmail}`).emit('call:ice-candidate', data));
+  socket.on('call:video-state', (data) => io.to(`user:${data.toEmail}`).emit('call:video-state', data));
   socket.on('call:end', (data) => io.to(`user:${data.toEmail}`).emit('call:ended', data));
   socket.on('call:decline', (data) => io.to(`user:${data.toEmail}`).emit('call:declined', data));
 
-  // --- グループ通話 (WebRTCメッシュ構成、Socket.IOでシグナリング中継) ---
-  socket.on('group-call:start', async ({ chatId, video }, callback) => {
+  // --- グループ通話 (WebRTCメッシュ構成、Socket.IOでシグナリング中継)
+  //     参加者ごとにマイク/カメラを個別にON/OFFできる(Zoom風)。カメラ状態は参加者Mapで保持。 ---
+  socket.on('group-call:start', async ({ chatId }, callback) => {
     try {
       const chat = await db.getChat(chatId);
       if (!chat || chat.type !== 'group' || !currentEmail) { if (callback) callback({ error: 'not found' }); return; }
       let call = activeGroupCalls.get(chatId);
-      if (!call) { call = { callId: uuidv4(), video: !!video, participants: new Set() }; activeGroupCalls.set(chatId, call); }
+      if (!call) { call = { callId: uuidv4(), participants: new Map() }; activeGroupCalls.set(chatId, call); }
       const roomName = `callroom:${chatId}`;
-      const existing = Array.from(call.participants);
-      call.participants.add(currentEmail);
+      const existing = Array.from(call.participants.entries()).map(([email, st]) => ({ email, videoOn: st.videoOn }));
+      call.participants.set(currentEmail, { videoOn: false });
       socket.join(roomName);
       socket.to(roomName).emit('group-call:peer-joined', { chatId, email: currentEmail });
-      if (callback) callback({ callId: call.callId, video: call.video, participants: existing });
+      if (callback) callback({ callId: call.callId, participants: existing });
 
       const starter = await db.getUser(currentEmail);
       chat.members.filter((m) => m !== currentEmail && !call.participants.has(m)).forEach((m) => {
         io.to(`user:${m}`).emit('group-call:incoming', {
-          chatId, callId: call.callId, video: call.video,
+          chatId, callId: call.callId,
           chatName: chat.name, chatAvatar: chat.avatar,
           fromEmail: currentEmail, fromName: starter ? starter.name : currentEmail,
         });
         db.isChatMuted(m, chatId).then((muted) => {
-          if (!muted) sendPushToUser(m, { title: chat.name, body: `${starter ? starter.name : currentEmail} がグループ通話を開始しました`, url: '/', tag: `groupcall-${chatId}` });
+          if (!muted) sendPushToUser(m, { title: chat.name, body: `${starter ? starter.name : currentEmail} が通話を開始しました`, url: '/', tag: `groupcall-${chatId}` });
         });
       });
     } catch (err) {
@@ -699,11 +701,11 @@ io.on('connection', (socket) => {
       const call = activeGroupCalls.get(chatId);
       if (!call) { if (callback) callback({ error: 'no active call' }); return; }
       const roomName = `callroom:${chatId}`;
-      const existing = Array.from(call.participants);
-      call.participants.add(currentEmail);
+      const existing = Array.from(call.participants.entries()).map(([email, st]) => ({ email, videoOn: st.videoOn }));
+      call.participants.set(currentEmail, { videoOn: false });
       socket.join(roomName);
       socket.to(roomName).emit('group-call:peer-joined', { chatId, email: currentEmail });
-      if (callback) callback({ callId: call.callId, video: call.video, participants: existing });
+      if (callback) callback({ callId: call.callId, participants: existing });
     } catch (err) {
       console.error('group-call:join error:', err);
       if (callback) callback({ error: 'server error' });
@@ -713,6 +715,15 @@ io.on('connection', (socket) => {
   // offer/answer/ice candidateを相手ユーザーへ中継するだけ(P2Pメッシュなので実データは通らない)
   socket.on('group-call:signal', (data) => {
     io.to(`user:${data.toEmail}`).emit('group-call:signal', data);
+  });
+
+  // 参加者のカメラON/OFF状態を同じ通話ルームの他メンバーへブロードキャストする
+  socket.on('group-call:video-state', ({ chatId, videoOn }) => {
+    const call = activeGroupCalls.get(chatId);
+    if (call && currentEmail && call.participants.has(currentEmail)) {
+      call.participants.get(currentEmail).videoOn = !!videoOn;
+    }
+    socket.to(`callroom:${chatId}`).emit('group-call:video-state', { chatId, email: currentEmail, videoOn: !!videoOn });
   });
 
   function leaveGroupCallRoom(chatId) {

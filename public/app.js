@@ -325,6 +325,7 @@ function connectSocket() {
   });
   socket.on('call:answered', (data) => { if (state.call && state.call.callId === data.callId) handleAnswered(data); });
   socket.on('call:ice-candidate', (data) => { if (state.call && state.call.callId === data.callId) handleRemoteIce(data); });
+  socket.on('call:video-state', (data) => { if (state.call && state.call.callId === data.callId) { state.call.remoteCamOn = data.videoOn; applyRemoteCamState(); } });
   socket.on('call:ended', (data) => { if (state.call && state.call.callId === data.callId) endCallLocal(); });
   socket.on('call:declined', (data) => { if (state.call && state.call.callId === data.callId) { setCallStatus('相手が応答しませんでした'); setTimeout(endCallLocal, 1200); } });
 
@@ -346,6 +347,10 @@ function connectSocket() {
     connectToGroupPeer(email, false); // 相手からのofferを待つ
   });
   socket.on('group-call:signal', (data) => handleGroupCallSignal(data));
+  socket.on('group-call:video-state', ({ chatId, email, videoOn }) => {
+    if (!state.groupCall || state.groupCall.chatId !== chatId) return;
+    setGroupTileVideoState(email, videoOn);
+  });
   socket.on('group-call:peer-left', ({ chatId, email }) => {
     if (!state.groupCall || state.groupCall.chatId !== chatId) return;
     const pc = groupPeers.get(email);
@@ -492,12 +497,8 @@ function renderChatShell(chat) {
             ${chat.type === 'group' ? `<div class="chat-header-sub">${chat.members.length}人のメンバー</div>` : ''}
           </div>
         </div>
-        ${chat.type === 'dm' && peer ? `
-          <button class="icon-btn" id="btn-call-audio" title="音声通話">📞</button>
-          <button class="icon-btn" id="btn-call-video" title="ビデオ通話">🎥</button>` : ''}
-        ${chat.type === 'group' ? `
-          <button class="icon-btn" id="btn-group-call-audio" title="グループ音声通話">📞</button>
-          <button class="icon-btn" id="btn-group-call-video" title="グループビデオ通話">🎥</button>` : ''}
+        ${chat.type === 'dm' && peer ? `<button class="icon-btn" id="btn-call" title="通話">📞</button>` : ''}
+        ${chat.type === 'group' ? `<button class="icon-btn" id="btn-group-call" title="グループ通話">📞</button>` : ''}
         <button class="icon-btn" id="btn-chat-menu" title="その他">⋮</button>
       </div>
       <div class="messages" id="messages"></div>
@@ -522,12 +523,10 @@ function renderChatShell(chat) {
     document.getElementById('chat-header-clickable').onclick = () => openGroupInfoModal(chat.id);
   }
   if (chat.type === 'dm' && peer) {
-    document.getElementById('btn-call-audio').onclick = () => startCall(peer, false);
-    document.getElementById('btn-call-video').onclick = () => startCall(peer, true);
+    document.getElementById('btn-call').onclick = () => startCall(peer);
   }
   if (chat.type === 'group') {
-    document.getElementById('btn-group-call-audio').onclick = () => startGroupCall(chat, false);
-    document.getElementById('btn-group-call-video').onclick = () => startGroupCall(chat, true);
+    document.getElementById('btn-group-call').onclick = () => startGroupCall(chat);
   }
   document.getElementById('btn-chat-menu').onclick = () => openChatMenu(chat, peer);
   document.getElementById('btn-image').onclick = () => document.getElementById('file-input').click();
@@ -1132,7 +1131,16 @@ function openNewChatModal() {
 
 /* ------------------------------- CALLS (WebRTC via Socket.IO signaling) ------------------------------- */
 
-let localStream = null, pc = null, appliedIceStart = 0;
+let localStream = null, pc = null, remoteStream = null, appliedIceStart = 0;
+
+// マイク+カメラの両方を要求し、カメラが使えない/拒否された場合はマイクのみにフォールバックする
+async function acquireCallStream() {
+  try { return await navigator.mediaDevices.getUserMedia({ audio: true, video: true }); }
+  catch {
+    try { return await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { return null; }
+  }
+}
 
 function callBtnHTML() {
   return `
@@ -1159,32 +1167,52 @@ function setCallStatus(text) {
   if (el) el.textContent = text;
 }
 
-async function startCall(peer, video) {
+// ローカルのカメラON/OFF状態をUIに反映する(カメラトラックが無い場合はボタン自体を隠す)
+function applyLocalCamState() {
+  const lv = document.getElementById('local-video');
+  const camBtn = document.getElementById('call-cam-btn');
+  const hasVideoTrack = localStream && localStream.getVideoTracks().length > 0;
+  if (camBtn) camBtn.style.display = hasVideoTrack ? 'flex' : 'none';
+  if (!hasVideoTrack) { if (state.call) state.call.camOn = false; return; }
+  localStream.getVideoTracks().forEach((t) => t.enabled = state.call.camOn);
+  if (state.call.camOn) { lv.srcObject = localStream; lv.style.display = 'block'; }
+  else { lv.style.display = 'none'; }
+}
+
+// 相手のカメラON/OFF状態(シグナリングで明示的に共有された値)をUIに反映する
+function applyRemoteCamState() {
+  const rv = document.getElementById('remote-video');
+  const avatarStage = document.getElementById('avatar-stage');
+  if (!rv || !avatarStage || !state.call) return;
+  if (state.call.remoteCamOn && remoteStream) { rv.style.display = 'block'; avatarStage.style.display = 'none'; }
+  else { rv.style.display = 'none'; avatarStage.style.display = 'block'; }
+}
+
+async function startCall(peer) {
   const callId = uid('call');
-  state.call = { callId, chatId: state.activeChatId, peer, isCaller: true, video, micOn: true, camOn: video };
+  state.call = { callId, chatId: state.activeChatId, peer, isCaller: true, micOn: true, camOn: false, remoteCamOn: false };
   appliedIceStart = 0;
   document.body.insertAdjacentHTML('beforeend', callBtnHTML());
   document.getElementById('call-peer-name').textContent = peer.name;
   document.getElementById('avatar-stage').innerHTML = avatarHTML(peer, 110);
   wireCallControls();
 
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
-  } catch {
+  localStream = await acquireCallStream();
+  if (!localStream) {
     setCallStatus('マイク／カメラを利用できません');
     setTimeout(endCallLocal, 1500);
     return;
   }
-  setupLocalVideo(video);
+  applyLocalCamState();
 
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
-  pc.ontrack = (e) => { showRemoteStream(e.streams[0], video); };
+  pc.ontrack = (e) => { remoteStream = e.streams[0]; document.getElementById('remote-video').srcObject = remoteStream; applyRemoteCamState(); };
   pc.onicecandidate = (e) => { if (e.candidate) state.socket.emit('call:ice-candidate', { toEmail: peer.email, fromEmail: state.user.email, callId, candidate: e.candidate.toJSON() }); };
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  state.socket.emit('call:invite', { toEmail: peer.email, fromEmail: state.user.email, chatId: state.activeChatId, callId, video, offer: { type: offer.type, sdp: offer.sdp } });
+  state.socket.emit('call:invite', { toEmail: peer.email, fromEmail: state.user.email, chatId: state.activeChatId, callId, offer: { type: offer.type, sdp: offer.sdp } });
   setCallStatus('発信中…');
 }
 
@@ -1198,7 +1226,7 @@ function renderIncomingCall() {
     <div class="incoming-call-card">
       ${avatarHTML(peer, 72)}
       <div style="font-weight:800;font-size:16px;margin-top:12px;color:var(--text)">${esc(peer.name)}</div>
-      <div style="font-size:13px;color:var(--text-dim);margin-bottom:6px">${data.video ? 'ビデオ通話の着信' : '音声通話の着信'}</div>
+      <div style="font-size:13px;color:var(--text-dim);margin-bottom:6px">通話の着信</div>
       <div class="incoming-actions">
         <button class="call-btn end" id="decline-btn">📵</button>
         <button class="call-btn" id="accept-btn" style="background:#06C755">📞</button>
@@ -1216,7 +1244,7 @@ function renderIncomingCall() {
 async function acceptIncoming(data, peer, overlay) {
   document.body.removeChild(overlay);
   state.incomingCall = null;
-  state.call = { callId: data.callId, chatId: data.chatId, peer, isCaller: false, video: data.video, micOn: true, camOn: data.video };
+  state.call = { callId: data.callId, chatId: data.chatId, peer, isCaller: false, micOn: true, camOn: false, remoteCamOn: false };
   appliedIceStart = 0;
   document.body.insertAdjacentHTML('beforeend', callBtnHTML());
   document.getElementById('call-peer-name').textContent = peer.name;
@@ -1224,18 +1252,17 @@ async function acceptIncoming(data, peer, overlay) {
   wireCallControls();
   setCallStatus('接続中…');
 
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: data.video });
-  } catch {
+  localStream = await acquireCallStream();
+  if (!localStream) {
     setCallStatus('マイク／カメラを利用できません');
     setTimeout(endCallLocal, 1500);
     return;
   }
-  setupLocalVideo(data.video);
+  applyLocalCamState();
 
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
-  pc.ontrack = (e) => showRemoteStream(e.streams[0], data.video);
+  pc.ontrack = (e) => { remoteStream = e.streams[0]; document.getElementById('remote-video').srcObject = remoteStream; applyRemoteCamState(); };
   pc.onicecandidate = (e) => { if (e.candidate) state.socket.emit('call:ice-candidate', { toEmail: peer.email, fromEmail: state.user.email, callId: data.callId, candidate: e.candidate.toJSON() }); };
 
   await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
@@ -1256,38 +1283,24 @@ async function handleRemoteIce(data) {
   try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch { /* ignore */ }
 }
 
-function setupLocalVideo(video) {
-  const lv = document.getElementById('local-video');
-  if (video) { lv.srcObject = localStream; lv.style.display = 'block'; document.getElementById('avatar-stage').style.display = 'none'; }
-}
-function showRemoteStream(stream, video) {
-  if (video) {
-    const rv = document.getElementById('remote-video');
-    rv.srcObject = stream; rv.style.display = 'block';
-    document.getElementById('avatar-stage').style.display = 'none';
-  }
-  setCallStatus('通話中');
-}
-
 function wireCallControls() {
   document.getElementById('call-mic-btn').onclick = () => {
     if (!localStream) return;
     state.call.micOn = !state.call.micOn;
     localStream.getAudioTracks().forEach((t) => t.enabled = state.call.micOn);
-    document.getElementById('call-mic-btn').classList.toggle('off', !state.call.micOn);
-    document.getElementById('call-mic-btn').textContent = state.call.micOn ? '🎤' : '🔇';
+    const btn = document.getElementById('call-mic-btn');
+    btn.classList.toggle('off', !state.call.micOn);
+    btn.textContent = state.call.micOn ? '🎤' : '🔇';
   };
-  const camBtn = document.getElementById('call-cam-btn');
-  if (state.call.video) {
-    camBtn.style.display = 'flex';
-    camBtn.onclick = () => {
-      if (!localStream) return;
-      state.call.camOn = !state.call.camOn;
-      localStream.getVideoTracks().forEach((t) => t.enabled = state.call.camOn);
-      camBtn.classList.toggle('off', !state.call.camOn);
-      camBtn.textContent = state.call.camOn ? '📷' : '🚫';
-    };
-  }
+  document.getElementById('call-cam-btn').onclick = () => {
+    if (!localStream || localStream.getVideoTracks().length === 0) return;
+    state.call.camOn = !state.call.camOn;
+    applyLocalCamState();
+    state.socket.emit('call:video-state', { toEmail: state.call.peer.email, callId: state.call.callId, videoOn: state.call.camOn });
+    const btn = document.getElementById('call-cam-btn');
+    btn.classList.toggle('off', !state.call.camOn);
+    btn.textContent = state.call.camOn ? '📷' : '🚫';
+  };
   document.getElementById('call-end-btn').onclick = () => {
     if (state.call) state.socket.emit('call:end', { toEmail: state.call.peer.email, callId: state.call.callId });
     endCallLocal();
@@ -1297,6 +1310,7 @@ function wireCallControls() {
 function endCallLocal() {
   if (pc) { try { pc.close(); } catch {} pc = null; }
   if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  remoteStream = null;
   const overlay = document.getElementById('call-overlay');
   if (overlay) overlay.remove();
   state.call = null;
@@ -1306,13 +1320,14 @@ function endCallLocal() {
 
 let groupLocalStream = null;
 const groupPeers = new Map(); // email -> RTCPeerConnection
+const groupRemoteVideoOn = new Map(); // email -> bool (相手のカメラON/OFF、シグナリングで明示共有)
 
 function groupTileId(email) { return `gc-tile-${email.replace(/[^a-zA-Z0-9]/g, '_')}`; }
 
-async function startGroupCall(chat, video) {
-  state.socket.emit('group-call:start', { chatId: chat.id, video }, (res) => {
+async function startGroupCall(chat) {
+  state.socket.emit('group-call:start', { chatId: chat.id }, (res) => {
     if (!res || res.error) { alert('通話を開始できませんでした'); return; }
-    enterGroupCallUI(chat, res.callId, res.video, res.participants);
+    enterGroupCallUI(chat, res.callId, res.participants);
   });
 }
 
@@ -1324,7 +1339,7 @@ function showIncomingGroupCallBanner(data) {
     <div class="incoming-call-card">
       ${avatarHTML({ avatar: data.chatAvatar || '👥', bg: '#2E3A59' }, 64)}
       <div style="font-weight:800;font-size:16px;margin-top:12px;color:var(--text)">${esc(data.chatName)}</div>
-      <div style="font-size:13px;color:var(--text-dim);margin-bottom:6px">${esc(data.fromName)}さんがグループ${data.video ? 'ビデオ' : '音声'}通話を開始しました</div>
+      <div style="font-size:13px;color:var(--text-dim);margin-bottom:6px">${esc(data.fromName)}さんが通話を開始しました</div>
       <div class="incoming-actions">
         <button class="call-btn end" id="gc-decline-btn">📵</button>
         <button class="call-btn" id="gc-accept-btn" style="background:#06C755">📞</button>
@@ -1337,24 +1352,26 @@ function showIncomingGroupCallBanner(data) {
     state.socket.emit('group-call:join', { chatId: data.chatId }, (res) => {
       if (!res || res.error) return;
       const chat = currentChatById(data.chatId) || { id: data.chatId, name: data.chatName, avatar: data.chatAvatar, type: 'group' };
-      enterGroupCallUI(chat, res.callId, res.video, res.participants);
+      enterGroupCallUI(chat, res.callId, res.participants);
     });
   };
 }
 
-async function enterGroupCallUI(chat, callId, video, existingParticipants) {
-  state.groupCall = { chatId: chat.id, callId, video, micOn: true, camOn: !!video };
+async function enterGroupCallUI(chat, callId, participants) {
+  state.groupCall = { chatId: chat.id, callId, micOn: true, camOn: false };
+  groupRemoteVideoOn.clear();
   renderGroupCallOverlay(chat);
-  try {
-    groupLocalStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: !!video });
-  } catch {
+  groupLocalStream = await acquireCallStream();
+  if (!groupLocalStream) {
     alert('マイク／カメラを利用できません');
     leaveGroupCall();
     return;
   }
-  addLocalGroupTile(video);
-  for (const email of existingParticipants) {
-    await connectToGroupPeer(email, true); // 自分が新規参加者側なのでofferを送る
+  applyGroupLocalCamState();
+  addLocalGroupTile();
+  for (const p of participants) {
+    await connectToGroupPeer(p.email, true); // 自分が新規参加者側なのでofferを送る
+    setGroupTileVideoState(p.email, !!p.videoOn);
   }
 }
 
@@ -1416,35 +1433,58 @@ function renderGroupCallOverlay(chat) {
     <div class="gc-grid" id="group-call-tiles"></div>
     <div class="call-controls">
       <button class="call-btn" id="gc-mic-btn">🎤</button>
-      ${state.groupCall.video ? '<button class="call-btn" id="gc-cam-btn">📷</button>' : ''}
+      <button class="call-btn" id="gc-cam-btn" style="display:none">📷</button>
       <button class="call-btn end" id="gc-leave-btn">📵</button>
     </div>`;
   document.body.appendChild(div);
   document.getElementById('gc-mic-btn').onclick = () => {
     state.groupCall.micOn = !state.groupCall.micOn;
     groupLocalStream.getAudioTracks().forEach((t) => t.enabled = state.groupCall.micOn);
-    document.getElementById('gc-mic-btn').textContent = state.groupCall.micOn ? '🎤' : '🔇';
+    const btn = document.getElementById('gc-mic-btn');
+    btn.classList.toggle('off', !state.groupCall.micOn);
+    btn.textContent = state.groupCall.micOn ? '🎤' : '🔇';
   };
-  const camBtn = document.getElementById('gc-cam-btn');
-  if (camBtn) camBtn.onclick = () => {
+  document.getElementById('gc-cam-btn').onclick = () => {
+    if (!groupLocalStream || groupLocalStream.getVideoTracks().length === 0) return;
     state.groupCall.camOn = !state.groupCall.camOn;
-    groupLocalStream.getVideoTracks().forEach((t) => t.enabled = state.groupCall.camOn);
-    camBtn.textContent = state.groupCall.camOn ? '📷' : '🚫';
+    applyGroupLocalCamState();
+    state.socket.emit('group-call:video-state', { chatId: state.groupCall.chatId, videoOn: state.groupCall.camOn });
+    const btn = document.getElementById('gc-cam-btn');
+    btn.classList.toggle('off', !state.groupCall.camOn);
+    btn.textContent = state.groupCall.camOn ? '📷' : '🚫';
   };
   document.getElementById('gc-leave-btn').onclick = leaveGroupCall;
 }
 
-function addLocalGroupTile(video) {
+// 自分のカメラON/OFF状態を自分のタイルとボタンに反映する(カメラトラックが無ければボタンを隠す)
+function applyGroupLocalCamState() {
+  const camBtn = document.getElementById('gc-cam-btn');
+  const hasVideoTrack = groupLocalStream && groupLocalStream.getVideoTracks().length > 0;
+  if (camBtn) camBtn.style.display = hasVideoTrack ? 'flex' : 'none';
+  if (!hasVideoTrack) { state.groupCall.camOn = false; return; }
+  groupLocalStream.getVideoTracks().forEach((t) => t.enabled = state.groupCall.camOn);
+  const tile = document.getElementById(groupTileId(state.user.email));
+  if (!tile) return;
+  const video = tile.querySelector('video');
+  const avatarDiv = tile.querySelector('.gc-avatar');
+  if (state.groupCall.camOn) {
+    video.srcObject = groupLocalStream;
+    video.style.display = 'block';
+    if (avatarDiv) avatarDiv.style.display = 'none';
+  } else {
+    video.style.display = 'none';
+    if (avatarDiv) avatarDiv.style.display = 'flex';
+  }
+}
+
+function addLocalGroupTile() {
   const grid = document.getElementById('group-call-tiles');
   if (!grid) return;
   const div = document.createElement('div');
   div.className = 'gc-tile';
   div.id = groupTileId(state.user.email);
-  div.innerHTML = video
-    ? `<video autoplay playsinline muted class="gc-video"></video><div class="gc-name">${esc(state.user.name)}(自分)</div>`
-    : `<div class="gc-avatar">${avatarHTML(state.user, 64)}</div><div class="gc-name">${esc(state.user.name)}(自分)</div>`;
+  div.innerHTML = `<div class="gc-avatar">${avatarHTML(state.user, 64)}</div><video autoplay playsinline muted class="gc-video" style="display:none"></video><div class="gc-name">${esc(state.user.name)}(自分)</div>`;
   grid.appendChild(div);
-  if (video) div.querySelector('video').srcObject = groupLocalStream;
 }
 
 function addGroupPeerTile(email) {
@@ -1458,19 +1498,28 @@ function addGroupPeerTile(email) {
   grid.appendChild(div);
 }
 
+// 相手からの実映像ストリームを受け取った時に呼ばれる(表示するかどうかはvideoOn状態に従う)
 function setGroupRemoteTile(email, stream) {
   const tile = document.getElementById(groupTileId(email));
   if (!tile) return;
   const video = tile.querySelector('video');
-  const avatarDiv = tile.querySelector('.gc-avatar');
   video.srcObject = stream;
-  if (stream.getVideoTracks().length > 0) {
-    video.style.display = 'block';
-    if (avatarDiv) avatarDiv.style.display = 'none';
-  }
+  setGroupTileVideoState(email, groupRemoteVideoOn.get(email) || false);
+}
+
+// 相手のカメラON/OFF状態(シグナリングで明示的に共有された値)をタイルに反映する
+function setGroupTileVideoState(email, on) {
+  groupRemoteVideoOn.set(email, on);
+  const tile = document.getElementById(groupTileId(email));
+  if (!tile) return;
+  const video = tile.querySelector('video');
+  const avatarDiv = tile.querySelector('.gc-avatar');
+  if (on) { video.style.display = 'block'; if (avatarDiv) avatarDiv.style.display = 'none'; }
+  else { video.style.display = 'none'; if (avatarDiv) avatarDiv.style.display = 'flex'; }
 }
 
 function removeGroupCallTile(email) {
+  groupRemoteVideoOn.delete(email);
   const tile = document.getElementById(groupTileId(email));
   if (tile) tile.remove();
 }
@@ -1479,6 +1528,7 @@ function leaveGroupCall() {
   if (state.groupCall) state.socket.emit('group-call:leave', { chatId: state.groupCall.chatId });
   groupPeers.forEach((conn) => { try { conn.close(); } catch {} });
   groupPeers.clear();
+  groupRemoteVideoOn.clear();
   if (groupLocalStream) { groupLocalStream.getTracks().forEach((t) => t.stop()); groupLocalStream = null; }
   const overlay = document.getElementById('group-call-overlay');
   if (overlay) overlay.remove();
