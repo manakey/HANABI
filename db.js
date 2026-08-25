@@ -13,16 +13,14 @@ const isLocal = /localhost|127\.0\.0\.1/.test(connectionString || '');
 const pool = new Pool({
   connectionString,
   ssl: isLocal ? false : { rejectUnauthorized: false },
-  // Neon等の一部の接続では search_path が空になり "no schema has been selected to create in" が
-  // 発生することがあるため、プールが作るすべての接続で明示的に public スキーマを指定する
-  options: '-c search_path=public',
+  // 注意: options:'-c search_path=...' はNeon等のプール接続(PgBouncer)で
+  // "unsupported startup parameter" エラーになるため使用しない。
+  // 代わりに全クエリでテーブル名に public. を明示し、search_pathに依存しない構成にしている。
 });
 
 async function initSchema() {
-  // 接続オプションでも指定しているが、念のためここでも明示的に固定しておく(二重の安全策)
-  await pool.query(`SET search_path TO public;`);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
+    CREATE TABLE IF NOT EXISTS public.users (
       email TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       avatar TEXT,
@@ -32,12 +30,12 @@ async function initSchema() {
     );
   `);
   // 既存のテーブルにも password_hash 列を安全に追加する(パスワード認証機能の追加に伴う移行)
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS password_hash TEXT;`);
   // ミュート設定・ブロックリスト用の列
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS muted_chats JSONB NOT NULL DEFAULT '[]'::jsonb;`);
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_users JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS muted_chats JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS blocked_users JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS chats (
+    CREATE TABLE IF NOT EXISTS public.chats (
       id TEXT PRIMARY KEY,
       type TEXT NOT NULL,
       name TEXT,
@@ -51,9 +49,9 @@ async function initSchema() {
     );
   `);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages (
+    CREATE TABLE IF NOT EXISTS public.messages (
       id TEXT PRIMARY KEY,
-      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      chat_id TEXT NOT NULL REFERENCES public.chats(id) ON DELETE CASCADE,
       sender TEXT NOT NULL,
       type TEXT NOT NULL,
       content TEXT,
@@ -63,7 +61,7 @@ async function initSchema() {
       reply_to JSONB
     );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON public.messages(chat_id, ts);`);
   console.log('[db] スキーマの準備ができました');
 }
 
@@ -119,13 +117,13 @@ function mapMessage(row) {
 /* ---------------- users ---------------- */
 
 async function getUser(email) {
-  const { rows } = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+  const { rows } = await pool.query('SELECT * FROM public.users WHERE email=$1', [email]);
   return mapUser(rows[0]);
 }
 
 async function createUser({ email, name, avatar, bg, createdAt, passwordHash }) {
   const { rows } = await pool.query(
-    `INSERT INTO users (email, name, avatar, bg, created_at, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    `INSERT INTO public.users (email, name, avatar, bg, created_at, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [email, name, avatar, bg, createdAt, passwordHash || null]
   );
   return mapUser(rows[0]);
@@ -133,20 +131,20 @@ async function createUser({ email, name, avatar, bg, createdAt, passwordHash }) 
 
 // パスワードハッシュはmapUser()では絶対に返さない(公開APIレスポンスに漏れないようにするため専用関数を用意)
 async function getUserAuth(email) {
-  const { rows } = await pool.query('SELECT email, password_hash FROM users WHERE email=$1', [email]);
+  const { rows } = await pool.query('SELECT email, password_hash FROM public.users WHERE email=$1', [email]);
   return rows[0] || null;
 }
 
 // 通常のパスワード変更(既にパスワードがあっても上書きする)
 async function setPassword(email, passwordHash) {
-  const { rows } = await pool.query('UPDATE users SET password_hash=$2 WHERE email=$1 RETURNING *', [email, passwordHash]);
+  const { rows } = await pool.query('UPDATE public.users SET password_hash=$2 WHERE email=$1 RETURNING *', [email, passwordHash]);
   return mapUser(rows[0]);
 }
 
 // 初回パスワード設定専用: 既にパスワードが設定されている場合は上書きしない(乗っ取り防止)
 async function setInitialPassword(email, passwordHash) {
   const { rows } = await pool.query(
-    `UPDATE users SET password_hash=$2 WHERE email=$1 AND password_hash IS NULL RETURNING *`,
+    `UPDATE public.users SET password_hash=$2 WHERE email=$1 AND password_hash IS NULL RETURNING *`,
     [email, passwordHash]
   );
   return rows[0] ? mapUser(rows[0]) : null;
@@ -154,24 +152,24 @@ async function setInitialPassword(email, passwordHash) {
 
 async function updateUserProfile(email, { name, avatar, bg }) {
   const { rows } = await pool.query(
-    `UPDATE users SET name=$2, avatar=$3, bg=$4 WHERE email=$1 RETURNING *`,
+    `UPDATE public.users SET name=$2, avatar=$3, bg=$4 WHERE email=$1 RETURNING *`,
     [email, name, avatar, bg]
   );
   return mapUser(rows[0]);
 }
 
 async function listUsers() {
-  const { rows } = await pool.query('SELECT * FROM users ORDER BY created_at ASC');
+  const { rows } = await pool.query('SELECT * FROM public.users ORDER BY created_at ASC');
   return rows.map(mapUser);
 }
 
 async function getPushSubscriptions(email) {
-  const { rows } = await pool.query('SELECT push_subscriptions FROM users WHERE email=$1', [email]);
+  const { rows } = await pool.query('SELECT push_subscriptions FROM public.users WHERE email=$1', [email]);
   return rows[0] ? (rows[0].push_subscriptions || []) : [];
 }
 
 async function setPushSubscriptions(email, subs) {
-  await pool.query('UPDATE users SET push_subscriptions=$2 WHERE email=$1', [email, JSON.stringify(subs)]);
+  await pool.query('UPDATE public.users SET push_subscriptions=$2 WHERE email=$1', [email, JSON.stringify(subs)]);
 }
 
 async function addPushSubscription(email, sub) {
@@ -190,7 +188,7 @@ async function removePushSubscription(email, endpoint) {
 /* ---------------- ミュート設定 ---------------- */
 
 async function getMutedChats(email) {
-  const { rows } = await pool.query('SELECT muted_chats FROM users WHERE email=$1', [email]);
+  const { rows } = await pool.query('SELECT muted_chats FROM public.users WHERE email=$1', [email]);
   return rows[0] ? (rows[0].muted_chats || []) : [];
 }
 
@@ -198,7 +196,7 @@ async function toggleMuteChat(email, chatId) {
   const list = await getMutedChats(email);
   const idx = list.indexOf(chatId);
   if (idx >= 0) list.splice(idx, 1); else list.push(chatId);
-  await pool.query('UPDATE users SET muted_chats=$2 WHERE email=$1', [email, JSON.stringify(list)]);
+  await pool.query('UPDATE public.users SET muted_chats=$2 WHERE email=$1', [email, JSON.stringify(list)]);
   return list;
 }
 
@@ -210,20 +208,20 @@ async function isChatMuted(email, chatId) {
 /* ---------------- ブロック ---------------- */
 
 async function getBlockedUsers(email) {
-  const { rows } = await pool.query('SELECT blocked_users FROM users WHERE email=$1', [email]);
+  const { rows } = await pool.query('SELECT blocked_users FROM public.users WHERE email=$1', [email]);
   return rows[0] ? (rows[0].blocked_users || []) : [];
 }
 
 async function blockUser(email, targetEmail) {
   const list = await getBlockedUsers(email);
   if (!list.includes(targetEmail)) list.push(targetEmail);
-  await pool.query('UPDATE users SET blocked_users=$2 WHERE email=$1', [email, JSON.stringify(list)]);
+  await pool.query('UPDATE public.users SET blocked_users=$2 WHERE email=$1', [email, JSON.stringify(list)]);
   return list;
 }
 
 async function unblockUser(email, targetEmail) {
   const list = (await getBlockedUsers(email)).filter((e) => e !== targetEmail);
-  await pool.query('UPDATE users SET blocked_users=$2 WHERE email=$1', [email, JSON.stringify(list)]);
+  await pool.query('UPDATE public.users SET blocked_users=$2 WHERE email=$1', [email, JSON.stringify(list)]);
   return list;
 }
 
@@ -236,13 +234,13 @@ async function isBlocked(emailA, emailB) {
 /* ---------------- chats ---------------- */
 
 async function getChat(chatId) {
-  const { rows } = await pool.query('SELECT * FROM chats WHERE id=$1', [chatId]);
+  const { rows } = await pool.query('SELECT * FROM public.chats WHERE id=$1', [chatId]);
   return mapChat(rows[0]);
 }
 
 async function createChat(chat) {
   const { rows } = await pool.query(
-    `INSERT INTO chats (id, type, name, avatar, members, admins, reads, created_at, last_message, last_message_time)
+    `INSERT INTO public.chats (id, type, name, avatar, members, admins, reads, created_at, last_message, last_message_time)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
     [
       chat.id, chat.type, chat.name || null, chat.avatar || null,
@@ -254,17 +252,17 @@ async function createChat(chat) {
 }
 
 async function listChatIdsForUser(email) {
-  const { rows } = await pool.query('SELECT id FROM chats WHERE members ? $1', [email]);
+  const { rows } = await pool.query('SELECT id FROM public.chats WHERE members ? $1', [email]);
   return rows.map((r) => r.id);
 }
 
 async function listChatsForUser(email) {
   const { rows } = await pool.query(
     `SELECT c.*,
-       (SELECT COUNT(*)::int FROM messages m
+       (SELECT COUNT(*)::int FROM public.messages m
           WHERE m.chat_id = c.id AND m.sender <> $1 AND m.deleted = false
             AND m.ts > COALESCE((c.reads->>$1)::bigint, 0)) AS unread_count
-     FROM chats c
+     FROM public.chats c
      WHERE c.members ? $1
      ORDER BY c.last_message_time DESC NULLS LAST`,
     [email]
@@ -287,13 +285,13 @@ async function updateChatFields(chatId, fields) {
     }
   }
   if (sets.length === 0) return getChat(chatId);
-  const { rows } = await pool.query(`UPDATE chats SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, values);
+  const { rows } = await pool.query(`UPDATE public.chats SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, values);
   return mapChat(rows[0]);
 }
 
 async function setChatRead(chatId, email, ts) {
   await pool.query(
-    `UPDATE chats SET reads = COALESCE(reads,'{}'::jsonb) || jsonb_build_object($2::text, $3::bigint) WHERE id=$1`,
+    `UPDATE public.chats SET reads = COALESCE(reads,'{}'::jsonb) || jsonb_build_object($2::text, $3::bigint) WHERE id=$1`,
     [chatId, email, ts]
   );
 }
@@ -302,20 +300,20 @@ async function setChatRead(chatId, email, ts) {
 
 async function addMessage(chatId, message) {
   await pool.query(
-    `INSERT INTO messages (id, chat_id, sender, type, content, preview, ts, deleted, reply_to)
+    `INSERT INTO public.messages (id, chat_id, sender, type, content, preview, ts, deleted, reply_to)
      VALUES ($1,$2,$3,$4,$5,$6,$7,false,$8)`,
     [message.id, chatId, message.sender, message.type, message.content, message.preview, message.ts, message.replyTo ? JSON.stringify(message.replyTo) : null]
   );
 }
 
 async function listMessages(chatId) {
-  const { rows } = await pool.query('SELECT * FROM messages WHERE chat_id=$1 ORDER BY ts ASC', [chatId]);
+  const { rows } = await pool.query('SELECT * FROM public.messages WHERE chat_id=$1 ORDER BY ts ASC', [chatId]);
   return rows.map(mapMessage);
 }
 
 async function softDeleteMessage(chatId, messageId, email) {
   const { rows } = await pool.query(
-    `UPDATE messages SET deleted=true, content='', preview='メッセージを削除しました'
+    `UPDATE public.messages SET deleted=true, content='', preview='メッセージを削除しました'
      WHERE id=$1 AND chat_id=$2 AND sender=$3 AND deleted=false RETURNING *`,
     [messageId, chatId, email]
   );
