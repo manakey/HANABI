@@ -13,9 +13,14 @@ const isLocal = /localhost|127\.0\.0\.1/.test(connectionString || '');
 const pool = new Pool({
   connectionString,
   ssl: isLocal ? false : { rejectUnauthorized: false },
+  // Neon等の一部の接続では search_path が空になり "no schema has been selected to create in" が
+  // 発生することがあるため、プールが作るすべての接続で明示的に public スキーマを指定する
+  options: '-c search_path=public',
 });
 
 async function initSchema() {
+  // 接続オプションでも指定しているが、念のためここでも明示的に固定しておく(二重の安全策)
+  await pool.query(`SET search_path TO public;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
