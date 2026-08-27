@@ -18,6 +18,10 @@ const cloudinary = require('cloudinary').v2;
 const webpush = require('web-push');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { authenticator } = require('otplib');
+const QRCode = require('qrcode');
+const nodemailer = require('nodemailer');
 const db = require('./db');
 
 const app = express();
@@ -76,6 +80,21 @@ async function sendPushToUser(email, payload) {
   }
 }
 
+// --- メール送信: SMTP設定があればパスワードリセットメールを送信できる ---
+const USE_EMAIL = !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+let mailTransport = null;
+if (USE_EMAIL) {
+  mailTransport = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: Number(process.env.SMTP_PORT) === 465,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+  console.log('[mail] メール送信を有効化しました');
+} else {
+  console.log('[mail] SMTP未設定のため、パスワードリセットメールは送信されません（.env.example 参照）');
+}
+
 const AVATAR_EMOJIS = ['😀','😎','🐱','🐶','🐼','🦊','🐸','🦁','🐯','🐨','🦄','🐵','👽','🤖','👻','🎃','🌸','🍉','⚽','🎮'];
 const AVATAR_COLORS = ['#06C755','#FF6B4A','#4C6FFF','#F5A623','#B14CFF','#FF4C8B','#00B900','#2E3A59'];
 
@@ -110,7 +129,10 @@ app.use('/uploads', express.static(UPLOAD_DIR));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // --- ログイン不要で叩けるAPIのみ許可し、それ以外の /api/* は認証を必須にする ---
-const PUBLIC_API_PATHS = new Set(['/api/auth/check', '/api/register', '/api/login', '/api/set-password', '/api/push/vapid-public-key']);
+const PUBLIC_API_PATHS = new Set([
+  '/api/auth/check', '/api/register', '/api/login', '/api/set-password', '/api/push/vapid-public-key',
+  '/api/forgot-password', '/api/reset-password', '/api/2fa/login-verify',
+]);
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
   if (PUBLIC_API_PATHS.has(req.path)) return next();
@@ -187,10 +209,40 @@ app.post('/api/login', async (req, res) => {
     if (!auth || !auth.password_hash) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
     const ok = await bcrypt.compare(password, auth.password_hash);
     if (!ok) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+
+    const totpAuth = await db.getTotpAuth(email);
+    if (totpAuth && totpAuth.two_factor_enabled) {
+      // 2段階認証が有効なユーザーは、まだ完全なトークンを発行せず認証コード入力を要求する
+      const pendingToken = jwt.sign({ email, pending2FA: true }, JWT_SECRET, { expiresIn: '10m' });
+      return res.json({ requires2FA: true, pendingToken });
+    }
+
     const user = await db.getUser(email);
     res.json({ user, token: signToken(email) });
   } catch (err) {
     console.error('login error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+// 2段階認証コードを検証してログインを完了する
+app.post('/api/2fa/login-verify', async (req, res) => {
+  try {
+    const { pendingToken, code } = req.body;
+    let payload;
+    try { payload = jwt.verify(pendingToken || '', JWT_SECRET); }
+    catch { return res.status(401).json({ error: 'セッションが無効です。もう一度ログインしてください' }); }
+    if (!payload.pending2FA) return res.status(400).json({ error: 'invalid token' });
+
+    const totpAuth = await db.getTotpAuth(payload.email);
+    if (!totpAuth || !totpAuth.totp_secret) return res.status(400).json({ error: '2段階認証が設定されていません' });
+    const valid = authenticator.verify({ token: (code || '').trim(), secret: totpAuth.totp_secret });
+    if (!valid) return res.status(400).json({ error: '認証コードが正しくありません' });
+
+    const user = await db.getUser(payload.email);
+    res.json({ user, token: signToken(payload.email) });
+  } catch (err) {
+    console.error('2fa login-verify error:', err);
     res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
 });
@@ -222,6 +274,129 @@ app.get('/api/me', async (req, res) => {
     res.json({ user });
   } catch (err) {
     console.error('me error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+/* ---- パスワードリセット ---- */
+
+app.post('/api/forgot-password', async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim().toLowerCase();
+    const user = await db.getUser(email);
+    if (user && USE_EMAIL) {
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+      await db.setResetToken(email, tokenHash, Date.now() + 30 * 60 * 1000); // 30分間有効
+      const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+      const resetUrl = `${appUrl}/?reset=${rawToken}`;
+      try {
+        await mailTransport.sendMail({
+          from: process.env.SMTP_FROM || process.env.SMTP_USER,
+          to: email,
+          subject: 'Hanabi Chat - パスワード再設定',
+          text: `以下のリンクからパスワードを再設定してください(30分間有効です)。\n\n${resetUrl}\n\n心当たりがない場合はこのメールを無視してください。`,
+          html: `<p>以下のリンクからパスワードを再設定してください(30分間有効です)。</p><p><a href="${resetUrl}">${resetUrl}</a></p><p>心当たりがない場合はこのメールを無視してください。</p>`,
+        });
+      } catch (mailErr) {
+        console.error('mail send error:', mailErr);
+      }
+    }
+    // メールの存在有無を第三者に推測させないため、成否に関わらず同じレスポンスを返す
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('forgot-password error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const rawToken = req.body.token || '';
+    const password = req.body.password || '';
+    if (password.length < 6) return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const user = await db.getUserByResetToken(tokenHash);
+    if (!user) return res.status(400).json({ error: 'リンクが無効か有効期限が切れています。もう一度お試しください' });
+    const passwordHash = await bcrypt.hash(password, 10);
+    await db.setPassword(user.email, passwordHash);
+    await db.clearResetToken(user.email);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('reset-password error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+/* ---- 2段階認証(TOTP)の設定 ---- */
+
+app.post('/api/2fa/setup', async (req, res) => {
+  try {
+    const email = req.userEmail;
+    const secret = authenticator.generateSecret();
+    await db.setPendingTotpSecret(email, secret);
+    const otpauth = authenticator.keyuri(email, 'Hanabi Chat', secret);
+    const qrDataUrl = await QRCode.toDataURL(otpauth);
+    res.json({ secret, qrDataUrl });
+  } catch (err) {
+    console.error('2fa setup error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.post('/api/2fa/verify', async (req, res) => {
+  try {
+    const email = req.userEmail;
+    const code = (req.body.code || '').trim();
+    const totpAuth = await db.getTotpAuth(email);
+    if (!totpAuth || !totpAuth.totp_pending_secret) return res.status(400).json({ error: '先に設定を開始してください' });
+    const valid = authenticator.verify({ token: code, secret: totpAuth.totp_pending_secret });
+    if (!valid) return res.status(400).json({ error: 'コードが正しくありません' });
+    const user = await db.confirmTotp(email);
+    res.json({ user });
+  } catch (err) {
+    console.error('2fa verify error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.post('/api/2fa/disable', async (req, res) => {
+  try {
+    const email = req.userEmail;
+    const password = req.body.password || '';
+    const auth = await db.getUserAuth(email);
+    if (!auth || !auth.password_hash) return res.status(400).json({ error: 'パスワードが設定されていません' });
+    const ok = await bcrypt.compare(password, auth.password_hash);
+    if (!ok) return res.status(401).json({ error: 'パスワードが正しくありません' });
+    await db.disableTotp(email);
+    const user = await db.getUser(email);
+    res.json({ user });
+  } catch (err) {
+    console.error('2fa disable error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+/* ---- チャット背景画像 ---- */
+
+app.post('/api/chats/:chatId/background', async (req, res) => {
+  try {
+    const url = req.body.url;
+    if (!url) return res.status(400).json({ error: 'invalid' });
+    const chatBackgrounds = await db.setChatBackground(req.userEmail, req.params.chatId, url);
+    res.json({ chatBackgrounds });
+  } catch (err) {
+    console.error('set background error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
+});
+
+app.delete('/api/chats/:chatId/background', async (req, res) => {
+  try {
+    const chatBackgrounds = await db.clearChatBackground(req.userEmail, req.params.chatId);
+    res.json({ chatBackgrounds });
+  } catch (err) {
+    console.error('clear background error:', err);
     res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
 });

@@ -34,6 +34,15 @@ async function initSchema() {
   // ミュート設定・ブロックリスト用の列
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS muted_chats JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS blocked_users JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  // 2段階認証(TOTP)用の列
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS totp_secret TEXT;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS totp_pending_secret TEXT;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN NOT NULL DEFAULT FALSE;`);
+  // パスワードリセット用の列
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS reset_token_hash TEXT;`);
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS reset_token_expires BIGINT;`);
+  // チャット背景画像(ユーザーごとの見た目設定)
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS chat_backgrounds JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS public.chats (
       id TEXT PRIMARY KEY,
@@ -78,6 +87,8 @@ function mapUser(row) {
     pushSubscriptions: row.push_subscriptions || [],
     mutedChats: row.muted_chats || [],
     blockedUsers: row.blocked_users || [],
+    twoFactorEnabled: row.two_factor_enabled || false,
+    chatBackgrounds: row.chat_backgrounds || {},
   };
 }
 
@@ -231,6 +242,78 @@ async function isBlocked(emailA, emailB) {
   return a.includes(emailB) || b.includes(emailA);
 }
 
+/* ---------------- 2段階認証(TOTP) ---------------- */
+
+async function setPendingTotpSecret(email, secret) {
+  await pool.query('UPDATE public.users SET totp_pending_secret=$2 WHERE email=$1', [email, secret]);
+}
+
+async function getTotpAuth(email) {
+  const { rows } = await pool.query(
+    'SELECT totp_secret, totp_pending_secret, two_factor_enabled FROM public.users WHERE email=$1',
+    [email]
+  );
+  return rows[0] || null;
+}
+
+// 保留中のシークレットを本採用して2FAを有効化する
+async function confirmTotp(email) {
+  const { rows } = await pool.query(
+    `UPDATE public.users SET totp_secret = totp_pending_secret, totp_pending_secret = NULL, two_factor_enabled = TRUE
+     WHERE email=$1 AND totp_pending_secret IS NOT NULL RETURNING *`,
+    [email]
+  );
+  return rows[0] ? mapUser(rows[0]) : null;
+}
+
+async function disableTotp(email) {
+  await pool.query(
+    'UPDATE public.users SET totp_secret=NULL, totp_pending_secret=NULL, two_factor_enabled=FALSE WHERE email=$1',
+    [email]
+  );
+}
+
+/* ---------------- パスワードリセット ---------------- */
+
+async function setResetToken(email, tokenHash, expiresAt) {
+  await pool.query(
+    'UPDATE public.users SET reset_token_hash=$2, reset_token_expires=$3 WHERE email=$1',
+    [email, tokenHash, expiresAt]
+  );
+}
+
+async function getUserByResetToken(tokenHash) {
+  const { rows } = await pool.query(
+    'SELECT * FROM public.users WHERE reset_token_hash=$1 AND reset_token_expires > $2',
+    [tokenHash, Date.now()]
+  );
+  return mapUser(rows[0]);
+}
+
+async function clearResetToken(email) {
+  await pool.query('UPDATE public.users SET reset_token_hash=NULL, reset_token_expires=NULL WHERE email=$1', [email]);
+}
+
+/* ---------------- チャット背景画像 ---------------- */
+
+async function setChatBackground(email, chatId, url) {
+  const { rows } = await pool.query(
+    `UPDATE public.users SET chat_backgrounds = COALESCE(chat_backgrounds,'{}'::jsonb) || jsonb_build_object($2::text, $3::text)
+     WHERE email=$1 RETURNING chat_backgrounds`,
+    [email, chatId, url]
+  );
+  return rows[0] ? rows[0].chat_backgrounds : {};
+}
+
+async function clearChatBackground(email, chatId) {
+  const { rows } = await pool.query(
+    `UPDATE public.users SET chat_backgrounds = COALESCE(chat_backgrounds,'{}'::jsonb) - $2::text
+     WHERE email=$1 RETURNING chat_backgrounds`,
+    [email, chatId]
+  );
+  return rows[0] ? rows[0].chat_backgrounds : {};
+}
+
 /* ---------------- chats ---------------- */
 
 async function getChat(chatId) {
@@ -328,6 +411,9 @@ module.exports = {
   getPushSubscriptions, setPushSubscriptions, addPushSubscription, removePushSubscription,
   getMutedChats, toggleMuteChat, isChatMuted,
   getBlockedUsers, blockUser, unblockUser, isBlocked,
+  setPendingTotpSecret, getTotpAuth, confirmTotp, disableTotp,
+  setResetToken, getUserByResetToken, clearResetToken,
+  setChatBackground, clearChatBackground,
   getChat, createChat, listChatIdsForUser, listChatsForUser, updateChatFields, setChatRead,
   addMessage, listMessages, softDeleteMessage,
 };
