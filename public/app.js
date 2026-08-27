@@ -89,6 +89,14 @@ const api = {
   toggleMute: (chatId) => authFetch(`/api/chats/${chatId}/mute`, { method: 'POST' }),
   block: (targetEmail) => authFetch('/api/block', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ targetEmail }) }),
   unblock: (targetEmail) => authFetch('/api/unblock', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ targetEmail }) }),
+  forgotPassword: (email) => fetch('/api/forgot-password', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email }) }).then((r) => r.json()),
+  resetPassword: (token, password) => fetch('/api/reset-password', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ token, password }) }).then((r) => r.json()),
+  twoFactorLoginVerify: (pendingToken, code) => fetch('/api/2fa/login-verify', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ pendingToken, code }) }).then((r) => r.json()),
+  twoFactorSetup: () => authFetch('/api/2fa/setup', { method: 'POST' }),
+  twoFactorVerify: (code) => authFetch('/api/2fa/verify', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ code }) }),
+  twoFactorDisable: (password) => authFetch('/api/2fa/disable', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ password }) }),
+  setBackground: (chatId, url) => authFetch(`/api/chats/${chatId}/background`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ url }) }),
+  clearBackground: (chatId) => authFetch(`/api/chats/${chatId}/background`, { method: 'DELETE' }),
 };
 
 const state = {
@@ -106,6 +114,21 @@ const state = {
 };
 
 const appEl = document.getElementById('app');
+
+// --- 通知音・着信音 ---
+const notifySound = new Audio('/sounds/notify.wav');
+const ringSound = new Audio('/sounds/ringtone.wav');
+ringSound.loop = true;
+
+function playNotifySound() {
+  try { notifySound.currentTime = 0; notifySound.play().catch(() => {}); } catch { /* ignore */ }
+}
+function startRingtone() {
+  try { ringSound.currentTime = 0; ringSound.play().catch(() => {}); } catch { /* ignore */ }
+}
+function stopRingtone() {
+  try { ringSound.pause(); ringSound.currentTime = 0; } catch { /* ignore */ }
+}
 
 function isMuted(chatId) { return (state.user.mutedChats || []).includes(chatId); }
 function isBlockedUser(email) { return (state.user.blockedUsers || []).includes(email); }
@@ -129,6 +152,10 @@ function renderLogin() {
         <div id="login-body"></div>
       </div>
     </div>`;
+  // URLに ?reset=トークン が付いていればパスワード再設定画面を優先表示する
+  const params = new URLSearchParams(window.location.search);
+  const resetToken = params.get('reset');
+  if (resetToken) { renderResetPasswordStep(resetToken); return; }
   renderLoginEmailStep();
 }
 
@@ -220,15 +247,88 @@ function renderPasswordLoginStep(email) {
       <div id="login-error" class="error-text" style="display:none"></div>
       <button class="btn-primary" type="submit">ログイン</button>
     </form>
+    <button type="button" id="forgot-password-btn" class="link-btn">パスワードをお忘れですか？</button>
     <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
   document.getElementById('back-to-email').onclick = renderLoginEmailStep;
+  document.getElementById('forgot-password-btn').onclick = () => renderForgotPasswordStep(email);
   document.getElementById('login-form4').onsubmit = async (e) => {
     e.preventDefault();
     const password = document.getElementById('login-password').value;
     const res = await api.login(email, password);
     if (res.error) { showLoginError(res.error); return; }
+    if (res.requires2FA) { renderTwoFactorLoginStep(res.pendingToken); return; }
     setToken(res.token);
     onLoggedIn(res.user);
+  };
+}
+
+function renderTwoFactorLoginStep(pendingToken) {
+  const body = document.getElementById('login-body');
+  body.innerHTML = `
+    <p style="font-size:13px;color:#456;margin-top:0">認証アプリに表示されている6桁のコードを入力してください。</p>
+    <form id="login-form-2fa">
+      <input class="field" id="twofa-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="123456" autofocus required style="text-align:center;letter-spacing:6px;font-size:20px" />
+      <div id="login-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" type="submit">認証してログイン</button>
+    </form>
+    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+  document.getElementById('back-to-email').onclick = renderLoginEmailStep;
+  document.getElementById('login-form-2fa').onsubmit = async (e) => {
+    e.preventDefault();
+    const code = document.getElementById('twofa-code').value.trim();
+    const res = await api.twoFactorLoginVerify(pendingToken, code);
+    if (res.error) { showLoginError(res.error); return; }
+    setToken(res.token);
+    onLoggedIn(res.user);
+  };
+}
+
+function renderForgotPasswordStep(email) {
+  const body = document.getElementById('login-body');
+  body.innerHTML = `
+    <p style="font-size:13px;color:#456;margin-top:0">登録されているメールアドレスにパスワード再設定用のリンクを送信します。</p>
+    <form id="forgot-form">
+      <input class="field" type="email" id="forgot-email" value="${esc(email || '')}" placeholder="you@example.com" required />
+      <div id="login-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" type="submit">再設定メールを送信</button>
+    </form>
+    <button type="button" id="back-to-email" class="link-btn">ログイン画面に戻る</button>`;
+  document.getElementById('back-to-email').onclick = renderLoginEmailStep;
+  document.getElementById('forgot-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const target = document.getElementById('forgot-email').value.trim().toLowerCase();
+    const btn = e.target.querySelector('button[type=submit]');
+    btn.disabled = true; btn.textContent = '送信中…';
+    await api.forgotPassword(target);
+    body.innerHTML = `
+      <p style="font-size:13px;color:#456;margin-top:0">${esc(target)} 宛にメールを送信しました(登録されている場合)。メール内のリンクからパスワードを再設定してください。届かない場合は迷惑メールフォルダもご確認ください。</p>
+      <button type="button" id="back-to-email2" class="link-btn">ログイン画面に戻る</button>`;
+    document.getElementById('back-to-email2').onclick = renderLoginEmailStep;
+  };
+}
+
+function renderResetPasswordStep(token) {
+  const body = document.getElementById('login-body');
+  body.innerHTML = `
+    <p style="font-size:13px;color:#456;margin-top:0">新しいパスワードを設定してください。</p>
+    <form id="reset-form">
+      <input class="field" id="reset-password" type="password" placeholder="新しいパスワード(6文字以上)" autofocus required minlength="6" />
+      <input class="field" id="reset-password2" type="password" placeholder="新しいパスワード(確認)" required minlength="6" />
+      <div id="login-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" type="submit">パスワードを更新する</button>
+    </form>`;
+  document.getElementById('reset-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const p1 = document.getElementById('reset-password').value;
+    const p2 = document.getElementById('reset-password2').value;
+    if (p1 !== p2) { showLoginError('パスワードが一致しません'); return; }
+    const res = await api.resetPassword(token, p1);
+    if (res.error) { showLoginError(res.error); return; }
+    window.history.replaceState({}, '', window.location.pathname); // URLからトークンを消す
+    body.innerHTML = `
+      <p style="font-size:13px;color:#456;margin-top:0">パスワードを更新しました。新しいパスワードでログインしてください。</p>
+      <button type="button" id="go-login" class="btn-primary">ログイン画面へ</button>`;
+    document.getElementById('go-login').onclick = renderLoginEmailStep;
   };
 }
 
@@ -301,6 +401,7 @@ function connectSocket() {
       if (chat && message.sender !== state.user.email) {
         chat.unreadCount = (chat.unreadCount || 0) + 1;
         renderSidebarList();
+        if (!isMuted(chatId)) playNotifySound();
       }
     }
   });
@@ -322,11 +423,20 @@ function connectSocket() {
     if (state.call) { socket.emit('call:decline', { toEmail: data.fromEmail, callId: data.callId }); return; }
     state.incomingCall = data;
     renderIncomingCall();
+    startRingtone();
   });
   socket.on('call:answered', (data) => { if (state.call && state.call.callId === data.callId) handleAnswered(data); });
   socket.on('call:ice-candidate', (data) => { if (state.call && state.call.callId === data.callId) handleRemoteIce(data); });
   socket.on('call:video-state', (data) => { if (state.call && state.call.callId === data.callId) { state.call.remoteCamOn = data.videoOn; applyRemoteCamState(); } });
-  socket.on('call:ended', (data) => { if (state.call && state.call.callId === data.callId) endCallLocal(); });
+  socket.on('call:ended', (data) => {
+    if (state.incomingCall && state.incomingCall.callId === data.callId) {
+      stopRingtone();
+      const overlay = document.getElementById('incoming-call-overlay');
+      if (overlay) overlay.remove();
+      state.incomingCall = null;
+    }
+    if (state.call && state.call.callId === data.callId) endCallLocal();
+  });
   socket.on('call:declined', (data) => { if (state.call && state.call.callId === data.callId) { setCallStatus('相手が応答しませんでした'); setTimeout(endCallLocal, 1200); } });
 
   socket.on('message:blocked', ({ chatId }) => {
@@ -513,6 +623,8 @@ function renderChatShell(chat) {
       </form>
     </div>`;
 
+  applyChatBackground(chat.id);
+
   document.getElementById('btn-back').onclick = () => {
     state.activeChatId = null;
     renderMainEmpty();
@@ -535,6 +647,51 @@ function renderChatShell(chat) {
   document.getElementById('composer').onsubmit = handleSendText;
 }
 
+function applyChatBackground(chatId) {
+  const view = document.querySelector('.chat-view');
+  if (!view) return;
+  const url = (state.user.chatBackgrounds || {})[chatId];
+  if (url) {
+    view.style.backgroundImage = `linear-gradient(rgba(234,243,239,0.55), rgba(234,243,239,0.55)), url("${url}")`;
+    view.style.backgroundSize = 'cover';
+    view.style.backgroundPosition = 'center';
+  } else {
+    view.style.backgroundImage = '';
+  }
+}
+
+function openBackgroundModal(chatId) {
+  const overlay = openModal('チャットの背景', '', false);
+  const body = overlay.bodyEl;
+  const current = (state.user.chatBackgrounds || {})[chatId];
+  body.innerHTML = `
+    ${current ? `<img src="${esc(current)}" style="width:100%;border-radius:12px;margin-bottom:14px;max-height:160px;object-fit:cover" />` : ''}
+    <input type="file" id="bg-file-input" accept="image/*" style="display:none" />
+    <button class="action-btn" id="bg-choose-btn">🖼️ 画像を選ぶ</button>
+    ${current ? `<button class="action-btn danger" id="bg-clear-btn">背景を元に戻す</button>` : ''}
+  `;
+  document.getElementById('bg-choose-btn').onclick = () => document.getElementById('bg-file-input').click();
+  document.getElementById('bg-file-input').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const compressed = await compressImage(file, 1080, 0.75);
+      const { url } = await api.upload(compressed);
+      const res = await api.setBackground(chatId, url);
+      state.user.chatBackgrounds = res.chatBackgrounds;
+      applyChatBackground(chatId);
+      document.body.removeChild(overlay);
+    } catch { alert('背景の設定に失敗しました'); }
+  };
+  const clearBtn = document.getElementById('bg-clear-btn');
+  if (clearBtn) clearBtn.onclick = async () => {
+    const res = await api.clearBackground(chatId);
+    state.user.chatBackgrounds = res.chatBackgrounds;
+    applyChatBackground(chatId);
+    document.body.removeChild(overlay);
+  };
+}
+
 function openChatMenu(chat, peer) {
   const muted = isMuted(chat.id);
   const blocked = peer ? isBlockedUser(peer.email) : false;
@@ -542,9 +699,11 @@ function openChatMenu(chat, peer) {
   const body = overlay.bodyEl;
   body.innerHTML = `
     <button class="action-btn" id="menu-mute">${muted ? '🔔 通知をオンにする' : '🔕 通知をオフにする'}</button>
+    <button class="action-btn" id="menu-background">🖼️ 背景を変更</button>
     ${chat.type === 'group' ? `<button class="action-btn" id="menu-group-info">👥 グループ情報</button>` : ''}
     ${chat.type === 'dm' && peer ? `<button class="action-btn danger" id="menu-block">${blocked ? 'ブロックを解除する' : '🚫 ブロックする'}</button>` : ''}
   `;
+  document.getElementById('menu-background').onclick = () => { document.body.removeChild(overlay); openBackgroundModal(chat.id); };
   document.getElementById('menu-mute').onclick = async () => {
     const res = await api.toggleMute(chat.id);
     state.user.mutedChats = res.mutedChats;
@@ -1008,7 +1167,11 @@ function openProfileModal() {
     <div class="emoji-grid" id="profile-emoji-grid">${AVATAR_EMOJIS.map((e) => `<button data-e="${e}" class="${e === avatar ? 'selected' : ''}">${e}</button>`).join('')}</div>
     <div style="font-size:12px;font-weight:700;color:var(--text-dim);margin-bottom:6px">背景色</div>
     <div class="color-row" id="profile-color-row">${AVATAR_COLORS.map((c) => `<button data-c="${c}" class="color-dot ${c === bg ? 'selected' : ''}" style="background:${c}"></button>`).join('')}</div>
-    <button class="btn-primary" id="profile-save" style="margin-bottom:8px">保存する</button>
+    <button class="btn-primary" id="profile-save" style="margin-bottom:16px">保存する</button>
+    <div style="border-top:1px solid var(--border);padding-top:14px;margin-bottom:14px">
+      <div style="font-size:12px;font-weight:700;color:var(--text-dim);margin-bottom:8px">セキュリティ</div>
+      <div id="twofa-section"></div>
+    </div>
     <button id="profile-logout" style="width:100%;padding:11px 0;border-radius:10px;border:1px solid var(--border);background:var(--panel-bg);color:#c33;font-weight:700;cursor:pointer">ログアウト</button>
   `, false);
 
@@ -1038,6 +1201,72 @@ function openProfileModal() {
     document.body.removeChild(overlay);
     renderLogin();
   };
+
+  renderTwoFactorSection();
+
+  function renderTwoFactorSection() {
+    const section = document.getElementById('twofa-section');
+    if (state.user.twoFactorEnabled) {
+      section.innerHTML = `
+        <div style="font-size:13px;color:var(--text);margin-bottom:10px">✅ 2段階認証は有効です</div>
+        <button class="action-btn danger" id="twofa-disable-btn">2段階認証を無効にする</button>`;
+      document.getElementById('twofa-disable-btn').onclick = () => renderTwoFactorDisableForm();
+    } else {
+      section.innerHTML = `
+        <div style="font-size:13px;color:var(--text-dim);margin-bottom:10px">認証アプリ(Google Authenticator等)を使ってログインをより安全にできます。</div>
+        <button class="action-btn" id="twofa-enable-btn">2段階認証を設定する</button>`;
+      document.getElementById('twofa-enable-btn').onclick = () => startTwoFactorSetup();
+    }
+  }
+
+  async function startTwoFactorSetup() {
+    const section = document.getElementById('twofa-section');
+    section.innerHTML = `<div style="font-size:13px;color:var(--text-dim)">QRコードを生成中…</div>`;
+    const res = await api.twoFactorSetup();
+    if (res.error) { section.innerHTML = `<div class="error-text" style="display:block">${esc(res.error)}</div>`; return; }
+    section.innerHTML = `
+      <div style="font-size:12.5px;color:var(--text-dim);margin-bottom:10px">認証アプリでQRコードを読み取り、表示された6桁のコードを入力してください。</div>
+      <div style="text-align:center;margin-bottom:10px"><img src="${res.qrDataUrl}" alt="QRコード" style="width:180px;height:180px;border-radius:8px" /></div>
+      <div style="font-size:11px;color:var(--text-dim);text-align:center;margin-bottom:10px;word-break:break-all">読み取れない場合はこのコードを手動入力: ${esc(res.secret)}</div>
+      <input class="field" id="twofa-setup-code" inputmode="numeric" maxlength="6" placeholder="123456" style="text-align:center;letter-spacing:6px" />
+      <div id="twofa-setup-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" id="twofa-confirm-btn" style="margin-bottom:8px">確認して有効化</button>
+      <button class="action-btn" id="twofa-cancel-btn">キャンセル</button>`;
+    document.getElementById('twofa-cancel-btn').onclick = renderTwoFactorSection;
+    document.getElementById('twofa-confirm-btn').onclick = async () => {
+      const code = document.getElementById('twofa-setup-code').value.trim();
+      const vres = await api.twoFactorVerify(code);
+      if (vres.error) {
+        const errEl = document.getElementById('twofa-setup-error');
+        errEl.textContent = vres.error; errEl.style.display = 'block';
+        return;
+      }
+      state.user = vres.user;
+      renderTwoFactorSection();
+    };
+  }
+
+  function renderTwoFactorDisableForm() {
+    const section = document.getElementById('twofa-section');
+    section.innerHTML = `
+      <div style="font-size:12.5px;color:var(--text-dim);margin-bottom:10px">無効にするには、確認のためパスワードを入力してください。</div>
+      <input class="field" id="twofa-disable-password" type="password" placeholder="パスワード" />
+      <div id="twofa-disable-error" class="error-text" style="display:none"></div>
+      <button class="btn-primary" id="twofa-disable-confirm" style="margin-bottom:8px;background:#c33">2段階認証を無効にする</button>
+      <button class="action-btn" id="twofa-disable-cancel">キャンセル</button>`;
+    document.getElementById('twofa-disable-cancel').onclick = renderTwoFactorSection;
+    document.getElementById('twofa-disable-confirm').onclick = async () => {
+      const password = document.getElementById('twofa-disable-password').value;
+      const res = await api.twoFactorDisable(password);
+      if (res.error) {
+        const errEl = document.getElementById('twofa-disable-error');
+        errEl.textContent = res.error; errEl.style.display = 'block';
+        return;
+      }
+      state.user = res.user;
+      renderTwoFactorSection();
+    };
+  }
 }
 
 /* ------------------------------- NEW CHAT MODAL ------------------------------- */
@@ -1235,10 +1464,11 @@ function renderIncomingCall() {
   document.body.appendChild(overlay);
   document.getElementById('decline-btn').onclick = () => {
     state.socket.emit('call:decline', { toEmail: data.fromEmail, callId: data.callId });
+    stopRingtone();
     document.body.removeChild(overlay);
     state.incomingCall = null;
   };
-  document.getElementById('accept-btn').onclick = () => acceptIncoming(data, peer, overlay);
+  document.getElementById('accept-btn').onclick = () => { stopRingtone(); acceptIncoming(data, peer, overlay); };
 }
 
 async function acceptIncoming(data, peer, overlay) {
@@ -1346,8 +1576,10 @@ function showIncomingGroupCallBanner(data) {
       </div>
     </div>`;
   document.body.appendChild(overlay);
-  document.getElementById('gc-decline-btn').onclick = () => document.body.removeChild(overlay);
+  startRingtone();
+  document.getElementById('gc-decline-btn').onclick = () => { stopRingtone(); document.body.removeChild(overlay); };
   document.getElementById('gc-accept-btn').onclick = () => {
+    stopRingtone();
     document.body.removeChild(overlay);
     state.socket.emit('group-call:join', { chatId: data.chatId }, (res) => {
       if (!res || res.error) return;
