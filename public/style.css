@@ -2,8 +2,20 @@
 html, body { margin: 0; height: 100%; font-family: 'Segoe UI', 'Hiragino Kaku Gothic ProN', system-ui, sans-serif; }
 html, body { height: 100vh; height: 100dvh; }
 #app { height: 100%; }
-button { font-family: inherit; }
+button { font-family: inherit; transition: transform 0.12s ease, opacity 0.12s ease, background-color 0.15s ease; }
+button:active { transform: scale(0.94); }
 input, select { font-family: inherit; }
+
+@keyframes fadeInUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes popIn { from { opacity: 0; transform: scale(0.92); } to { opacity: 1; transform: scale(1); } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+.msg-anim { animation: fadeInUp 0.25s ease both; }
+.chat-row { animation: fadeIn 0.2s ease both; }
+.modal-box { animation: popIn 0.18s cubic-bezier(0.2,0.8,0.3,1.2) both; }
+.modal-overlay { animation: fadeIn 0.15s ease both; }
+.call-overlay { animation: fadeIn 0.2s ease both; }
+.incoming-call-card { animation: popIn 0.25s cubic-bezier(0.2,0.8,0.3,1.2) both; }
 
 /* ---- カラー変数 (ライト/ダーク) ---- */
 :root {
@@ -206,3 +218,24 @@ html.dark {
 @media (max-width: 380px) {
   .emoji-grid, .sticker-panel { grid-template-columns: repeat(5,1fr); }
 }
+
+/* ---- ホームページ(未ログイン) ---- */
+.home-wrap { min-height: 100vh; min-height: 100dvh; background: linear-gradient(180deg,#03361f 0%,#06C755 45%,#0f1719 100%); color: #fff; overflow-y: auto; }
+.home-header { display: flex; align-items: center; justify-content: space-between; padding: 20px 24px; animation: fadeIn 0.4s ease both; }
+.home-nav-btn { padding: 9px 18px; border-radius: 20px; border: 1.5px solid rgba(255,255,255,0.6); background: transparent; color: #fff; font-weight: 700; font-size: 13px; cursor: pointer; }
+.home-nav-btn:hover { background: rgba(255,255,255,0.12); }
+.home-hero { text-align: center; padding: 60px 24px 40px; animation: slideUp 0.5s ease both; }
+.home-hero h1 { font-size: 32px; font-weight: 800; line-height: 1.4; margin: 0 0 16px; }
+.home-hero p { font-size: 14px; opacity: 0.9; max-width: 480px; margin: 0 auto 32px; line-height: 1.7; }
+.home-cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.home-cta-btn { width: auto; padding: 13px 32px; font-size: 15px; background: #fff; color: #06C755; }
+.home-secondary-btn { padding: 13px 28px; border-radius: 10px; border: 1.5px solid rgba(255,255,255,0.7); background: transparent; color: #fff; font-weight: 700; font-size: 15px; cursor: pointer; }
+.home-secondary-btn:hover { background: rgba(255,255,255,0.12); }
+.home-features { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; max-width: 900px; margin: 20px auto 60px; padding: 0 24px; }
+.home-feature { background: rgba(255,255,255,0.08); border-radius: 16px; padding: 22px 18px; text-align: center; animation: fadeInUp 0.5s ease both; backdrop-filter: blur(4px); }
+.home-feature-icon { font-size: 30px; margin-bottom: 10px; }
+.home-feature-title { font-weight: 700; font-size: 14px; margin-bottom: 6px; }
+.home-feature-desc { font-size: 12px; opacity: 0.85; line-height: 1.5; }
+.home-footer { text-align: center; font-size: 11px; opacity: 0.6; padding: 20px; }
+.home-back-link { background: none; border: none; color: #889; font-size: 12px; cursor: pointer; padding: 0; margin-bottom: 14px; text-align: left; display: block; }
+.home-back-link:hover { color: #06C755; }

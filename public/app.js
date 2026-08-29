@@ -140,10 +140,40 @@ function avatarHTML(profile, size = 40) {
 
 /* ------------------------------- LOGIN ------------------------------- */
 
+function renderHome() {
+  appEl.innerHTML = `
+    <div class="home-wrap">
+      <header class="home-header">
+        <div class="brand"><div class="brand-icon">💬</div>Hanabi</div>
+        <button class="home-nav-btn" id="home-login-btn">ログイン</button>
+      </header>
+      <main class="home-hero">
+        <h1>友達や仲間と、<br/>もっと自由につながろう。</h1>
+        <p>テキスト・スタンプ・写真・音声/ビデオ通話・グループ通話まで揃った、シンプルなリアルタイムチャットアプリ。</p>
+        <div class="home-cta">
+          <button class="btn-primary home-cta-btn" id="home-start-btn">無料ではじめる</button>
+          <button class="home-secondary-btn" id="home-login-btn2">ログイン</button>
+        </div>
+      </main>
+      <section class="home-features">
+        <div class="home-feature"><div class="home-feature-icon">💬</div><div class="home-feature-title">リアルタイムチャット</div><div class="home-feature-desc">既読表示・返信引用・リンクプレビュー</div></div>
+        <div class="home-feature"><div class="home-feature-icon">👥</div><div class="home-feature-title">グループチャット</div><div class="home-feature-desc">メンバー管理・管理者権限つき</div></div>
+        <div class="home-feature"><div class="home-feature-icon">📞</div><div class="home-feature-title">音声・ビデオ通話</div><div class="home-feature-desc">1対1からグループ通話まで対応</div></div>
+        <div class="home-feature"><div class="home-feature-icon">🔒</div><div class="home-feature-title">安心のセキュリティ</div><div class="home-feature-desc">パスワード認証・2段階認証・ブロック機能</div></div>
+      </section>
+      <footer class="home-footer">© Hanabi Chat</footer>
+    </div>`;
+  const goLogin = () => renderLogin();
+  document.getElementById('home-login-btn').onclick = goLogin;
+  document.getElementById('home-login-btn2').onclick = goLogin;
+  document.getElementById('home-start-btn').onclick = goLogin;
+}
+
 function renderLogin() {
   appEl.innerHTML = `
     <div class="login-wrap">
       <div class="login-card">
+        <button class="home-back-link" id="back-to-home">← トップページに戻る</button>
         <div class="login-logo">
           <div class="login-logo-icon">💬</div>
           <h1 class="login-title">Hanabi</h1>
@@ -152,6 +182,7 @@ function renderLogin() {
         <div id="login-body"></div>
       </div>
     </div>`;
+  document.getElementById('back-to-home').onclick = renderHome;
   // URLに ?reset=トークン が付いていればパスワード再設定画面を優先表示する
   const params = new URLSearchParams(window.location.search);
   const resetToken = params.get('reset');
@@ -583,7 +614,11 @@ async function openChat(chatId) {
   renderChatShell(chat);
   updateResponsiveLayout();
   state.messages = await api.messages(chatId);
-  renderMessages();
+  // 前回開いた時点で自分が読んでいた最後のメッセージの位置までスクロールする(それより下は未読=スクロールで見える)
+  const myReadTs = (chat && chat.reads && chat.reads[state.user.email]) || 0;
+  let lastReadMsgId = null;
+  for (const m of state.messages) { if (m.ts <= myReadTs) lastReadMsgId = m.id; else break; }
+  renderMessages(lastReadMsgId);
   markChatRead(chatId);
 }
 
@@ -738,12 +773,19 @@ function scrollToBottom() {
   if (m) m.scrollTop = m.scrollHeight;
 }
 
+function scrollToRow(msgId) {
+  const wrap = document.getElementById('messages');
+  const row = msgId && document.querySelector(`.msg-row[data-msg-id="${CSS.escape(msgId)}"]`);
+  if (wrap && row) wrap.scrollTop = row.offsetTop - 12;
+  else scrollToBottom();
+}
+
 function senderProfile(email) {
   if (email === state.user.email) return state.user;
   return state.directory.find((u) => u.email === email) || { name: email, avatar: '🙂', bg: '#888' };
 }
 
-function renderMessages() {
+function renderMessages(scrollTargetMsgId) {
   const wrap = document.getElementById('messages');
   if (!wrap) return;
   const chat = state.chats.find((c) => c.id === state.activeChatId);
@@ -752,16 +794,8 @@ function renderMessages() {
     return;
   }
 
-  // 既読ラベルを表示すべき最後の自分のメッセージを特定する(LINE風に最新の1件だけ表示)
+  // 自分が送ったメッセージのうち、相手が読んだものすべてに既読ラベルを表示する
   const others = chat.members.filter((m) => m !== state.user.email);
-  let lastReadIdx = -1, lastReadCount = 0;
-  if (chat.reads) {
-    state.messages.forEach((m, i) => {
-      if (m.sender !== state.user.email) return;
-      const cnt = others.filter((o) => (chat.reads[o] || 0) >= m.ts).length;
-      if (cnt > 0) { lastReadIdx = i; lastReadCount = cnt; }
-    });
-  }
 
   let html = '';
   let prevDay = null;
@@ -770,15 +804,18 @@ function renderMessages() {
     if (day !== prevDay) { html += `<div class="day-sep">${day}</div>`; prevDay = day; }
     const mine = m.sender === state.user.email;
     const sp = senderProfile(m.sender);
-    const showRead = mine && i === lastReadIdx;
-    const readLabel = showRead ? `<span class="read-label">${chat.type === 'group' ? `既読 ${lastReadCount}` : '既読'}</span>` : '';
+    let readLabel = '';
+    if (mine && chat.reads) {
+      const cnt = others.filter((o) => (chat.reads[o] || 0) >= m.ts).length;
+      if (cnt > 0) readLabel = `<span class="read-label">${chat.type === 'group' ? `既読 ${cnt}` : '既読'}</span>`;
+    }
     const replyBlock = (!m.deleted && m.replyTo) ? `
       <div class="reply-quote">
         <div class="reply-quote-name">${esc(senderProfile(m.replyTo.sender).name)}</div>
         <div class="reply-quote-text">${esc(m.replyTo.preview)}</div>
       </div>` : '';
     html += `
-      <div class="msg-row ${mine ? 'mine' : ''}" data-msg-id="${m.id}">
+      <div class="msg-row msg-anim ${mine ? 'mine' : ''}" data-msg-id="${m.id}">
         ${!mine && chat.type === 'group' ? avatarHTML(sp, 26) : ''}
         <div class="msg-col ${mine ? 'mine' : 'theirs'}">
           ${!mine && chat.type === 'group' ? `<div class="msg-sender">${esc(sp.name)}</div>` : ''}
@@ -791,7 +828,8 @@ function renderMessages() {
       </div>`;
   });
   wrap.innerHTML = html;
-  scrollToBottom();
+  if (scrollTargetMsgId) scrollToRow(scrollTargetMsgId);
+  else scrollToBottom();
 
   wrap.querySelectorAll('.msg-row').forEach((row) => {
     row.onclick = (e) => {
@@ -1771,4 +1809,8 @@ function leaveGroupCall() {
 
 applyStoredTheme();
 registerServiceWorker();
-tryAutoLogin().then((loggedIn) => { if (!loggedIn) renderLogin(); });
+tryAutoLogin().then((loggedIn) => {
+  if (loggedIn) return;
+  const hasResetToken = new URLSearchParams(window.location.search).get('reset');
+  if (hasResetToken) renderLogin(); else renderHome();
+});
