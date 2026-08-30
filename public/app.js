@@ -614,11 +614,7 @@ async function openChat(chatId) {
   renderChatShell(chat);
   updateResponsiveLayout();
   state.messages = await api.messages(chatId);
-  // 前回開いた時点で自分が読んでいた最後のメッセージの位置までスクロールする(それより下は未読=スクロールで見える)
-  const myReadTs = (chat && chat.reads && chat.reads[state.user.email]) || 0;
-  let lastReadMsgId = null;
-  for (const m of state.messages) { if (m.ts <= myReadTs) lastReadMsgId = m.id; else break; }
-  renderMessages(lastReadMsgId);
+  renderMessages();
   markChatRead(chatId);
 }
 
@@ -773,19 +769,12 @@ function scrollToBottom() {
   if (m) m.scrollTop = m.scrollHeight;
 }
 
-function scrollToRow(msgId) {
-  const wrap = document.getElementById('messages');
-  const row = msgId && document.querySelector(`.msg-row[data-msg-id="${CSS.escape(msgId)}"]`);
-  if (wrap && row) wrap.scrollTop = row.offsetTop - 12;
-  else scrollToBottom();
-}
-
 function senderProfile(email) {
   if (email === state.user.email) return state.user;
   return state.directory.find((u) => u.email === email) || { name: email, avatar: '🙂', bg: '#888' };
 }
 
-function renderMessages(scrollTargetMsgId) {
+function renderMessages() {
   const wrap = document.getElementById('messages');
   if (!wrap) return;
   const chat = state.chats.find((c) => c.id === state.activeChatId);
@@ -815,7 +804,7 @@ function renderMessages(scrollTargetMsgId) {
         <div class="reply-quote-text">${esc(m.replyTo.preview)}</div>
       </div>` : '';
     html += `
-      <div class="msg-row msg-anim ${mine ? 'mine' : ''}" data-msg-id="${m.id}">
+      <div class="msg-row ${mine ? 'mine' : ''}" data-msg-id="${m.id}">
         ${!mine && chat.type === 'group' ? avatarHTML(sp, 26) : ''}
         <div class="msg-col ${mine ? 'mine' : 'theirs'}">
           ${!mine && chat.type === 'group' ? `<div class="msg-sender">${esc(sp.name)}</div>` : ''}
@@ -828,8 +817,7 @@ function renderMessages(scrollTargetMsgId) {
       </div>`;
   });
   wrap.innerHTML = html;
-  if (scrollTargetMsgId) scrollToRow(scrollTargetMsgId);
-  else scrollToBottom();
+  scrollToBottom();
 
   wrap.querySelectorAll('.msg-row').forEach((row) => {
     row.onclick = (e) => {
