@@ -227,3 +227,8 @@ html.dark {
 .home-footer { text-align: center; font-size: 11px; opacity: 0.6; padding: 20px; }
 .home-back-link { background: none; border: none; color: #889; font-size: 12px; cursor: pointer; padding: 0; margin-bottom: 14px; text-align: left; display: block; }
 .home-back-link:hover { color: #06C755; }
+
+/* ---- iOS PWAインストール案内バナー ---- */
+.ios-install-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 70; background: #06C755; color: #fff; font-size: 12.5px; padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: max(10px, env(safe-area-inset-top)); }
+.ios-install-banner span { flex: 1; line-height: 1.4; }
+.ios-install-banner button { background: rgba(255,255,255,0.25); border: none; color: #fff; border-radius: 50%; width: 22px; height: 22px; flex-shrink: 0; cursor: pointer; font-size: 12px; }

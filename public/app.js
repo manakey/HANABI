@@ -517,6 +517,25 @@ function renderShell() {
   renderSidebar();
   renderMainEmpty();
   updateResponsiveLayout();
+  maybeShowIosInstallBanner();
+}
+
+// ---- iOS(iPhone/iPad)でホーム画面未追加の場合に案内バナーを表示 ----
+function maybeShowIosInstallBanner() {
+  const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone = window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+  if (!isIos || isStandalone) return;
+  if (localStorage.getItem('hanabi-ios-banner-dismissed') === '1') return;
+  const bar = document.createElement('div');
+  bar.className = 'ios-install-banner';
+  bar.innerHTML = `
+    <span>📲 ホーム画面に追加すると、通知が届くようになりアプリのように使えます。共有ボタン →「ホーム画面に追加」</span>
+    <button id="ios-banner-close">✕</button>`;
+  document.body.appendChild(bar);
+  document.getElementById('ios-banner-close').onclick = () => {
+    localStorage.setItem('hanabi-ios-banner-dismissed', '1');
+    bar.remove();
+  };
 }
 
 // ---- モバイル対応: 画面幅に応じてサイドバー/チャット表示を切り替える ----
@@ -818,6 +837,10 @@ function renderMessages() {
   });
   wrap.innerHTML = html;
   scrollToBottom();
+  setTimeout(scrollToBottom, 50);
+  wrap.querySelectorAll('img').forEach((img) => {
+    if (!img.complete) img.addEventListener('load', scrollToBottom, { once: true });
+  });
 
   wrap.querySelectorAll('.msg-row').forEach((row) => {
     row.onclick = (e) => {
