@@ -97,6 +97,14 @@ const api = {
   twoFactorDisable: (password) => authFetch('/api/2fa/disable', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ password }) }),
   setBackground: (chatId, url) => authFetch(`/api/chats/${chatId}/background`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ url }) }),
   clearBackground: (chatId) => authFetch(`/api/chats/${chatId}/background`, { method: 'DELETE' }),
+  adminUsers: () => authFetch('/api/admin/users'),
+  adminDeleteUser: (email) => authFetch(`/api/admin/users/${encodeURIComponent(email)}`, { method: 'DELETE' }),
+  adminChats: () => authFetch('/api/admin/chats'),
+  adminMessages: (chatId) => authFetch(`/api/admin/chats/${chatId}/messages`),
+  adminRenameChat: (chatId, data) => authFetch(`/api/admin/chats/${chatId}/rename`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }),
+  adminSetMembers: (chatId, members) => authFetch(`/api/admin/chats/${chatId}/members`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ members }) }),
+  adminSetAdmins: (chatId, admins) => authFetch(`/api/admin/chats/${chatId}/admins`, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ admins }) }),
+  adminDeleteChat: (chatId) => authFetch(`/api/admin/chats/${chatId}`, { method: 'DELETE' }),
 };
 
 const state = {
@@ -554,22 +562,133 @@ function updateResponsiveLayout() {
 }
 window.addEventListener('resize', updateResponsiveLayout);
 
+const SUPER_ADMIN_EMAIL = 'scratch.manakey@proton.me';
+
 function renderSidebar() {
   const sb = document.getElementById('sidebar');
+  const isAdmin = state.user.email === SUPER_ADMIN_EMAIL;
   sb.innerHTML = `
     <div class="sidebar-header">
       <div class="brand"><div class="brand-icon">💬</div>Hanabi</div>
       <div class="header-actions">
+        ${isAdmin ? `<button class="icon-btn" id="btn-admin" title="管理者モード">🛡️</button>` : ''}
         <button class="icon-btn" id="btn-theme" title="テーマ切替">${document.documentElement.classList.contains('dark') ? '☀️' : '🌙'}</button>
         <button class="icon-btn" id="btn-new-chat" title="新規チャット">＋</button>
         <button class="icon-btn" id="btn-profile" title="プロフィール">${state.user.avatar}</button>
       </div>
     </div>
     <div class="chat-list" id="chat-list"></div>`;
+  if (isAdmin) document.getElementById('btn-admin').onclick = openAdminPanel;
   document.getElementById('btn-theme').onclick = toggleTheme;
   document.getElementById('btn-new-chat').onclick = openNewChatModal;
   document.getElementById('btn-profile').onclick = openProfileModal;
   renderSidebarList();
+}
+
+/* ------------------------------- 管理者パネル ------------------------------- */
+
+function openAdminPanel() {
+  let mode = 'chats';
+  const overlay = openModal('管理者モード', '', true);
+  const body = overlay.bodyEl;
+
+  async function renderUsers() {
+    body.innerHTML = `<div style="text-align:center;color:var(--text-dim);font-size:13px;padding:20px 0">読み込み中…</div>`;
+    const users = await api.adminUsers();
+    body.innerHTML = `
+      <div class="tabs">
+        <button class="tab-btn" id="admin-tab-chats">チャット一覧</button>
+        <button class="tab-btn active" id="admin-tab-users">ユーザー一覧(${users.length})</button>
+      </div>
+      <div style="max-height:420px;overflow-y:auto">
+        ${users.map((u) => `
+          <div class="contact-row" style="justify-content:space-between;cursor:default">
+            <div style="display:flex;align-items:center;min-width:0">
+              ${avatarHTML(u, 34)}
+              <div style="margin-left:10px;min-width:0">
+                <div style="font-weight:700;font-size:13px;color:var(--text)">${esc(u.name)}</div>
+                <div style="font-size:11px;color:var(--text-dim)">${esc(u.email)}</div>
+              </div>
+            </div>
+            ${u.email === SUPER_ADMIN_EMAIL ? '' : `<button class="icon-btn" data-del-user="${esc(u.email)}" style="width:28px;height:28px;font-size:12px;color:#c33">✕</button>`}
+          </div>`).join('')}
+      </div>`;
+    document.getElementById('admin-tab-chats').onclick = () => { mode = 'chats'; renderChats(); };
+    body.querySelectorAll('[data-del-user]').forEach((b) => b.onclick = async () => {
+      const email = b.dataset.delUser;
+      if (!confirm(`${email} のアカウントを完全に削除しますか？この操作は取り消せません。`)) return;
+      await api.adminDeleteUser(email);
+      renderUsers();
+    });
+  }
+
+  async function renderChats() {
+    body.innerHTML = `<div style="text-align:center;color:var(--text-dim);font-size:13px;padding:20px 0">読み込み中…</div>`;
+    const chats = await api.adminChats();
+    body.innerHTML = `
+      <div class="tabs">
+        <button class="tab-btn active" id="admin-tab-chats">チャット一覧(${chats.length})</button>
+        <button class="tab-btn" id="admin-tab-users">ユーザー一覧</button>
+      </div>
+      <div style="max-height:420px;overflow-y:auto">
+        ${chats.map((c) => `
+          <div class="contact-row" data-chat="${c.id}">
+            ${avatarHTML(c.type === 'group' ? { avatar: c.avatar, bg: '#2E3A59' } : { avatar: '👤', bg: '#888' }, 34)}
+            <div style="margin-left:10px;min-width:0;flex:1">
+              <div style="font-weight:700;font-size:13px;color:var(--text)">${esc(c.name || (c.type === 'dm' ? c.members.join(' / ') : c.id))}</div>
+              <div style="font-size:11px;color:var(--text-dim)">${c.type === 'group' ? 'グループ' : '個人'} ・ ${c.members.length}人</div>
+            </div>
+          </div>`).join('')}
+      </div>`;
+    document.getElementById('admin-tab-users').onclick = () => { mode = 'users'; renderUsers(); };
+    body.querySelectorAll('[data-chat]').forEach((row) => row.onclick = () => openAdminChatDetail(row.dataset.chat, chats.find((c) => c.id === row.dataset.chat)));
+  }
+
+  async function openAdminChatDetail(chatId, chat) {
+    const msgOverlay = openModal(chat.name || chatId, '', true);
+    const mBody = msgOverlay.bodyEl;
+    const msgs = await api.adminMessages(chatId);
+    mBody.innerHTML = `
+      <div style="max-height:260px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;padding:8px;margin-bottom:14px">
+        ${msgs.length === 0 ? `<div style="text-align:center;color:var(--text-dim);font-size:12px;padding:14px 0">メッセージなし</div>` : msgs.map((m) => `
+          <div style="font-size:12px;margin-bottom:6px"><b style="color:var(--text)">${esc(m.sender)}:</b> <span style="color:var(--text-dim)">${m.deleted ? '(削除済み)' : esc(m.type === 'text' ? m.content : `[${m.type}]`)}</span></div>
+        `).join('')}
+      </div>
+      ${chat.type === 'group' ? `
+        <input class="field" id="admin-chat-name" value="${esc(chat.name || '')}" placeholder="グループ名" />
+        <button class="btn-primary" id="admin-rename-btn" style="margin-bottom:10px">名前を変更</button>
+        <div style="font-size:12px;font-weight:700;color:var(--text-dim);margin-bottom:6px">メンバー(タップで管理者⇄一般切替)</div>
+        <div id="admin-member-list" style="max-height:200px;overflow-y:auto;margin-bottom:10px">
+          ${chat.members.map((email) => `
+            <div class="contact-row" data-member="${esc(email)}" style="justify-content:space-between">
+              <span style="font-size:12.5px;color:var(--text)">${esc(email)}</span>
+              <span style="font-size:11px;color:${chat.admins.includes(email) ? 'var(--accent)' : 'var(--text-dim)'}">${chat.admins.includes(email) ? '👑 管理者' : 'メンバー'}</span>
+            </div>`).join('')}
+        </div>` : ''}
+      <button class="action-btn danger" id="admin-delete-chat-btn">🗑 このチャットを削除</button>`;
+
+    if (chat.type === 'group') {
+      document.getElementById('admin-rename-btn').onclick = async () => {
+        await api.adminRenameChat(chatId, { name: document.getElementById('admin-chat-name').value.trim() });
+        document.body.removeChild(msgOverlay);
+      };
+      mBody.querySelectorAll('[data-member]').forEach((row) => row.onclick = async () => {
+        const email = row.dataset.member;
+        const admins = chat.admins.includes(email) ? chat.admins.filter((e) => e !== email) : [...chat.admins, email];
+        chat.admins = (await api.adminSetAdmins(chatId, admins)).admins;
+        document.body.removeChild(msgOverlay);
+        openAdminChatDetail(chatId, chat);
+      });
+    }
+    document.getElementById('admin-delete-chat-btn').onclick = async () => {
+      if (!confirm('このチャットを完全に削除しますか？')) return;
+      await api.adminDeleteChat(chatId);
+      document.body.removeChild(msgOverlay);
+      document.body.removeChild(overlay);
+    };
+  }
+
+  renderChats();
 }
 
 function toggleTheme() {

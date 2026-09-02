@@ -403,6 +403,21 @@ async function softDeleteMessage(chatId, messageId, email) {
   return rows[0] ? mapMessage(rows[0]) : null;
 }
 
+/* ---------------- 管理者モード ---------------- */
+
+async function listAllChats() {
+  const { rows } = await pool.query('SELECT * FROM public.chats ORDER BY created_at DESC');
+  return rows.map((r) => mapChat(r));
+}
+
+async function deleteChat(chatId) {
+  await pool.query('DELETE FROM public.chats WHERE id=$1', [chatId]); // messagesはON DELETE CASCADEで自動削除
+}
+
+async function deleteUser(email) {
+  await pool.query('DELETE FROM public.users WHERE email=$1', [email]);
+}
+
 module.exports = {
   pool,
   initSchema,
@@ -416,4 +431,5 @@ module.exports = {
   setChatBackground, clearChatBackground,
   getChat, createChat, listChatIdsForUser, listChatsForUser, updateChatFields, setChatRead,
   addMessage, listMessages, softDeleteMessage,
+  listAllChats, deleteChat, deleteUser,
 };

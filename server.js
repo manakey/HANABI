@@ -123,6 +123,12 @@ function authMiddleware(req, res, next) {
   }
 }
 
+const SUPER_ADMIN_EMAIL = 'scratch.manakey@proton.me';
+function requireAdmin(req, res, next) {
+  if (req.userEmail !== SUPER_ADMIN_EMAIL) return res.status(403).json({ error: '権限がありません' });
+  next();
+}
+
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -751,6 +757,70 @@ app.post('/api/upload', upload.single('image'), async (req, res) => {
 });
 
 app.get('/healthz', (req, res) => res.send('ok'));
+
+/* ---- 管理者モード (scratch.manakey@proton.me 専用) ---- */
+
+app.get('/api/admin/users', authMiddleware, requireAdmin, async (req, res) => {
+  try { res.json(await db.listUsers()); }
+  catch (err) { console.error('admin list users error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.delete('/api/admin/users/:email', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const target = req.params.email.toLowerCase();
+    if (target === SUPER_ADMIN_EMAIL) return res.status(400).json({ error: '管理者アカウントは削除できません' });
+    await db.deleteUser(target);
+    res.json({ ok: true });
+  } catch (err) { console.error('admin delete user error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.get('/api/admin/chats', authMiddleware, requireAdmin, async (req, res) => {
+  try { res.json(await db.listAllChats()); }
+  catch (err) { console.error('admin list chats error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.get('/api/admin/chats/:chatId/messages', authMiddleware, requireAdmin, async (req, res) => {
+  try { res.json(await db.listMessages(req.params.chatId)); }
+  catch (err) { console.error('admin list messages error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.post('/api/admin/chats/:chatId/rename', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const fields = {};
+    if (req.body.name !== undefined) fields.name = req.body.name;
+    if (req.body.avatar !== undefined) fields.avatar = req.body.avatar;
+    const updated = await db.updateChatFields(req.params.chatId, fields);
+    if (updated) updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) { console.error('admin rename chat error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.post('/api/admin/chats/:chatId/members', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const members = Array.isArray(req.body.members) ? req.body.members.map((e) => e.toLowerCase()) : [];
+    const updated = await db.updateChatFields(req.params.chatId, { members });
+    if (updated) updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) { console.error('admin set members error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.post('/api/admin/chats/:chatId/admins', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const admins = Array.isArray(req.body.admins) ? req.body.admins.map((e) => e.toLowerCase()) : [];
+    const updated = await db.updateChatFields(req.params.chatId, { admins });
+    if (updated) updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+    res.json(updated);
+  } catch (err) { console.error('admin set admins error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
+
+app.delete('/api/admin/chats/:chatId', authMiddleware, requireAdmin, async (req, res) => {
+  try {
+    const chat = await db.getChat(req.params.chatId);
+    await db.deleteChat(req.params.chatId);
+    if (chat) chat.members.forEach((m) => io.to(`user:${m}`).emit('chat:removed', { chatId: req.params.chatId }));
+    res.json({ ok: true });
+  } catch (err) { console.error('admin delete chat error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }
+});
 
 /* ------------------------------- Socket.IO ------------------------------- */
 
