@@ -769,6 +769,18 @@ app.delete('/api/admin/users/:email', authMiddleware, requireAdmin, async (req, 
   try {
     const target = req.params.email.toLowerCase();
     if (target === SUPER_ADMIN_EMAIL) return res.status(400).json({ error: '管理者アカウントは削除できません' });
+    const allChats = await db.listAllChats();
+    for (const c of allChats) {
+      if (!c.members.includes(target)) continue;
+      const updated = await db.updateChatFields(c.id, {
+        members: c.members.filter((m) => m !== target),
+        admins: (c.admins || []).filter((m) => m !== target),
+      });
+      if (updated) {
+        updated.members.forEach((m) => io.to(`user:${m}`).emit('chat:updated', updated));
+      }
+    }
+    io.to(`user:${target}`).emit('account:deleted');
     await db.deleteUser(target);
     res.json({ ok: true });
   } catch (err) { console.error('admin delete user error:', err); res.status(500).json({ error: 'サーバーエラーが発生しました' }); }

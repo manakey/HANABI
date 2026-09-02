@@ -232,3 +232,8 @@ html.dark {
 .ios-install-banner { position: fixed; top: 0; left: 0; right: 0; z-index: 70; background: #06C755; color: #fff; font-size: 12.5px; padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: max(10px, env(safe-area-inset-top)); }
 .ios-install-banner span { flex: 1; line-height: 1.4; }
 .ios-install-banner button { background: rgba(255,255,255,0.25); border: none; color: #fff; border-radius: 50%; width: 22px; height: 22px; flex-shrink: 0; cursor: pointer; font-size: 12px; }
+
+/* ---- 管理者モード(フルスクリーン) ---- */
+.admin-screen { height: 100vh; height: 100dvh; display: flex; flex-direction: column; background: var(--bg); }
+.admin-header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.admin-title { font-weight: 800; font-size: 16px; color: var(--text); }
