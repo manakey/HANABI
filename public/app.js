@@ -163,6 +163,9 @@ function renderHome() {
           <button class="home-secondary-btn" id="home-login-btn2">ログイン</button>
         </div>
       </main>
+      <div class="home-video-wrap">
+        <video class="home-video" autoplay loop muted playsinline src="/promo.mp4"></video>
+      </div>
       <section class="home-features">
         <div class="home-feature"><div class="home-feature-icon">💬</div><div class="home-feature-title">リアルタイムチャット</div><div class="home-feature-desc">既読表示・返信引用・リンクプレビュー</div></div>
         <div class="home-feature"><div class="home-feature-icon">👥</div><div class="home-feature-title">グループチャット</div><div class="home-feature-desc">メンバー管理・管理者権限つき</div></div>
@@ -537,7 +540,7 @@ function maybeShowIosInstallBanner() {
   const bar = document.createElement('div');
   bar.className = 'ios-install-banner';
   bar.innerHTML = `
-    <span>📲 ホーム画面に追加すると、通知が届くようになりアプリのように使えます。共有ボタン →「ホーム画面に追加」</span>
+    <span>🔔 今のままだと通知が届きません！共有ボタン →「ホーム画面に追加」で今すぐ通知をON</span>
     <button id="ios-banner-close">✕</button>`;
   document.body.appendChild(bar);
   document.getElementById('ios-banner-close').onclick = () => {
@@ -573,7 +576,7 @@ function renderSidebar() {
       <div class="header-actions">
         ${isAdmin ? `<button class="icon-btn" id="btn-admin" title="管理者モード">🛡️</button>` : ''}
         <button class="icon-btn" id="btn-theme" title="テーマ切替">${document.documentElement.classList.contains('dark') ? '☀️' : '🌙'}</button>
-        <button class="icon-btn" id="btn-new-chat" title="新規チャット">＋</button>
+        <button class="icon-btn new-chat-btn" id="btn-new-chat" title="新規チャット">＋</button>
         <button class="icon-btn" id="btn-profile" title="プロフィール">${state.user.avatar}</button>
       </div>
     </div>
