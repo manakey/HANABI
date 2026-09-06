@@ -119,6 +119,8 @@ const state = {
   replyingTo: null,
   linkPreviews: {},
   groupCall: null,
+  presence: {}, // chatId -> { callUsers: [email], gameUsers: [email] }
+  gamePanelOpenChatId: null,
 };
 
 const appEl = document.getElementById('app');
@@ -509,6 +511,11 @@ function connectSocket() {
     if (pc) { pc.close(); groupPeers.delete(email); }
     removeGroupCallTile(email);
   });
+  socket.on('presence:update', ({ chatId, callUsers, gameUsers }) => {
+    state.presence[chatId] = { callUsers, gameUsers };
+    if (chatId === state.activeChatId) renderPresenceBanner();
+    renderSidebarList();
+  });
 }
 
 async function loadDirectory() { state.directory = await api.directory(); }
@@ -734,12 +741,14 @@ function renderSidebarList() {
     const title = c.type === 'group' ? c.name : (peer ? peer.name : '…');
     const av = c.type === 'group' ? { avatar: c.avatar, bg: '#2E3A59' } : peer;
     const unread = c.unreadCount || 0;
+    const pr = state.presence[c.id];
+    const presenceIcon = pr && (pr.callUsers.length || pr.gameUsers.length) ? `<span class="presence-dot">${pr.callUsers.length ? '📞' : '🎮'}</span>` : '';
     return `
       <div class="chat-row ${c.id === state.activeChatId ? 'active' : ''}" data-chat="${c.id}">
         ${avatarHTML(av, 46)}
         <div class="chat-row-body">
           <div class="chat-row-top">
-            <span class="chat-row-name">${esc(title)}</span>
+            <span class="chat-row-name">${esc(title)} ${presenceIcon}</span>
             <span class="chat-row-time">${c.lastMessageTime ? fmtTime(c.lastMessageTime) : ''}</span>
           </div>
           <div class="chat-row-bottom">
@@ -764,6 +773,7 @@ function renderMainEmpty() {
 async function openChat(chatId) {
   state.activeChatId = chatId;
   state.replyingTo = null;
+  if (state.gamePanelOpenChatId && state.gamePanelOpenChatId !== chatId) closeGamePanel();
   state.socket.emit('chat:join', chatId);
   const chat = state.chats.find((c) => c.id === chatId);
   if (chat) chat.unreadCount = 0;
@@ -797,8 +807,11 @@ function renderChatShell(chat) {
         </div>
         ${chat.type === 'dm' && peer ? `<button class="icon-btn" id="btn-call" title="通話">📞</button>` : ''}
         ${chat.type === 'group' ? `<button class="icon-btn" id="btn-group-call" title="グループ通話">📞</button>` : ''}
+        ${chat.type === 'group' ? `<button class="icon-btn" id="btn-game" title="みんなで遊ぶ">🎮</button>` : ''}
         <button class="icon-btn" id="btn-chat-menu" title="その他">⋮</button>
       </div>
+      <div id="presence-banner"></div>
+      <div id="game-panel" style="display:none"></div>
       <div class="messages" id="messages"></div>
       <div id="sticker-panel"></div>
       <div id="reply-bar" style="display:none"></div>
@@ -812,8 +825,10 @@ function renderChatShell(chat) {
     </div>`;
 
   applyChatBackground(chat.id);
+  renderPresenceBanner();
 
   document.getElementById('btn-back').onclick = () => {
+    closeGamePanel();
     state.activeChatId = null;
     renderMainEmpty();
     renderSidebarList();
@@ -827,12 +842,46 @@ function renderChatShell(chat) {
   }
   if (chat.type === 'group') {
     document.getElementById('btn-group-call').onclick = () => startGroupCall(chat);
+    document.getElementById('btn-game').onclick = () => toggleGamePanel(chat.id);
   }
   document.getElementById('btn-chat-menu').onclick = () => openChatMenu(chat, peer);
   document.getElementById('btn-image').onclick = () => document.getElementById('file-input').click();
   document.getElementById('file-input').onchange = handleImagePick;
   document.getElementById('btn-sticker').onclick = toggleStickerPanel;
   document.getElementById('composer').onsubmit = handleSendText;
+}
+
+// ---- 在席バナー(通話中・ゲーム中を表示) ----
+function renderPresenceBanner() {
+  const el = document.getElementById('presence-banner');
+  if (!el) return;
+  const p = state.presence[state.activeChatId];
+  if (!p || (p.callUsers.length === 0 && p.gameUsers.length === 0)) { el.innerHTML = ''; el.style.display = 'none'; return; }
+  const names = (emails) => emails.map((e) => senderProfile(e).name).join('、');
+  const lines = [];
+  if (p.callUsers.length > 0) lines.push(`<div class="presence-line presence-call">📞 ${esc(names(p.callUsers))}さんが通話中</div>`);
+  if (p.gameUsers.length > 0) lines.push(`<div class="presence-line presence-game">🎮 ${esc(names(p.gameUsers))}さんがゲーム中</div>`);
+  el.innerHTML = lines.join('');
+  el.style.display = 'block';
+}
+
+// ---- みんなで遊ぶ(ミニゲームパネル) ----
+function toggleGamePanel(chatId) {
+  const panel = document.getElementById('game-panel');
+  if (!panel) return;
+  if (state.gamePanelOpenChatId === chatId) { closeGamePanel(); return; }
+  panel.innerHTML = `<button class="icon-btn game-panel-close" id="game-panel-close">✕ 閉じる</button><iframe src="/games/survive.html" class="game-frame"></iframe>`;
+  panel.style.display = 'block';
+  state.gamePanelOpenChatId = chatId;
+  document.getElementById('game-panel-close').onclick = closeGamePanel;
+  state.socket.emit('game:start', { chatId });
+}
+
+function closeGamePanel() {
+  const panel = document.getElementById('game-panel');
+  if (state.gamePanelOpenChatId && state.socket) state.socket.emit('game:stop', { chatId: state.gamePanelOpenChatId });
+  state.gamePanelOpenChatId = null;
+  if (panel) { panel.innerHTML = ''; panel.style.display = 'none'; }
 }
 
 function applyChatBackground(chatId) {

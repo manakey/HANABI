@@ -838,6 +838,22 @@ app.delete('/api/admin/chats/:chatId', authMiddleware, requireAdmin, async (req,
 
 // グループ通話の状態はメモリ上で管理(chatId -> { callId, video, participants: Set<email> })
 const activeGroupCalls = new Map();
+const activeGames = new Map(); // chatId -> Set<email>
+
+async function broadcastChatPresence(chatId) {
+  try {
+    const chat = await db.getChat(chatId);
+    if (!chat) return;
+    const call = activeGroupCalls.get(chatId);
+    const game = activeGames.get(chatId);
+    const payload = {
+      chatId,
+      callUsers: call ? Array.from(call.participants.keys()) : [],
+      gameUsers: game ? Array.from(game) : [],
+    };
+    chat.members.forEach((m) => io.to(`user:${m}`).emit('presence:update', payload));
+  } catch (err) { console.error('broadcastChatPresence error:', err); }
+}
 
 io.on('connection', (socket) => {
   let currentEmail = null;
@@ -934,6 +950,7 @@ io.on('connection', (socket) => {
       socket.join(roomName);
       socket.to(roomName).emit('group-call:peer-joined', { chatId, email: currentEmail });
       if (callback) callback({ callId: call.callId, participants: existing });
+      broadcastChatPresence(chatId);
 
       const starter = await db.getUser(currentEmail);
       chat.members.filter((m) => m !== currentEmail && !call.participants.has(m)).forEach((m) => {
@@ -963,6 +980,7 @@ io.on('connection', (socket) => {
       socket.join(roomName);
       socket.to(roomName).emit('group-call:peer-joined', { chatId, email: currentEmail });
       if (callback) callback({ callId: call.callId, participants: existing });
+      broadcastChatPresence(chatId);
     } catch (err) {
       console.error('group-call:join error:', err);
       if (callback) callback({ error: 'server error' });
@@ -990,13 +1008,33 @@ io.on('connection', (socket) => {
     socket.leave(`callroom:${chatId}`);
     socket.to(`callroom:${chatId}`).emit('group-call:peer-left', { chatId, email: currentEmail });
     if (call.participants.size === 0) activeGroupCalls.delete(chatId);
+    broadcastChatPresence(chatId);
   }
 
   socket.on('group-call:leave', ({ chatId }) => leaveGroupCallRoom(chatId));
 
+  // --- ミニゲーム在席状態(プレゼンス通知用。ゲームの状態同期は行わずローカルプレイ) ---
+  socket.on('game:start', ({ chatId }) => {
+    if (!currentEmail) return;
+    let set = activeGames.get(chatId);
+    if (!set) { set = new Set(); activeGames.set(chatId, set); }
+    set.add(currentEmail);
+    broadcastChatPresence(chatId);
+  });
+
+  socket.on('game:stop', ({ chatId }) => {
+    if (!currentEmail) return;
+    const set = activeGames.get(chatId);
+    if (set) { set.delete(currentEmail); if (set.size === 0) activeGames.delete(chatId); }
+    broadcastChatPresence(chatId);
+  });
+
   socket.on('disconnect', () => {
     if (!currentEmail) return;
     for (const chatId of activeGroupCalls.keys()) leaveGroupCallRoom(chatId);
+    for (const [chatId, set] of activeGames.entries()) {
+      if (set.has(currentEmail)) { set.delete(currentEmail); if (set.size === 0) activeGames.delete(chatId); broadcastChatPresence(chatId); }
+    }
   });
 });
 
