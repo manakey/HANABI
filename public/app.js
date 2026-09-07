@@ -870,7 +870,8 @@ function toggleGamePanel(chatId) {
   const panel = document.getElementById('game-panel');
   if (!panel) return;
   if (state.gamePanelOpenChatId === chatId) { closeGamePanel(); return; }
-  panel.innerHTML = `<button class="icon-btn game-panel-close" id="game-panel-close">✕ 閉じる</button><iframe src="/games/survive.html" class="game-frame"></iframe>`;
+  const src = `/games/survive.html?chatId=${encodeURIComponent(chatId)}&email=${encodeURIComponent(state.user.email)}&name=${encodeURIComponent(state.user.name)}`;
+  panel.innerHTML = `<button class="icon-btn game-panel-close" id="game-panel-close">✕ 閉じる</button><iframe src="${src}" class="game-frame" allowfullscreen allow="fullscreen"></iframe>`;
   panel.style.display = 'block';
   state.gamePanelOpenChatId = chatId;
   document.getElementById('game-panel-close').onclick = closeGamePanel;

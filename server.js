@@ -839,6 +839,7 @@ app.delete('/api/admin/chats/:chatId', authMiddleware, requireAdmin, async (req,
 // グループ通話の状態はメモリ上で管理(chatId -> { callId, video, participants: Set<email> })
 const activeGroupCalls = new Map();
 const activeGames = new Map(); // chatId -> Set<email>
+const gamePlayers = new Map(); // chatId -> Map(email -> {name,x,y,hp,maxHp}) PvP用
 
 async function broadcastChatPresence(chatId) {
   try {
@@ -1029,12 +1030,61 @@ io.on('connection', (socket) => {
     broadcastChatPresence(chatId);
   });
 
+  // --- ミニゲーム内オンラインPvP(位置同期・攻撃) ---
+  socket.on('pvp:join', ({ chatId, name }) => {
+    if (!currentEmail || !chatId) return;
+    let room = gamePlayers.get(chatId);
+    if (!room) { room = new Map(); gamePlayers.set(chatId, room); }
+    room.set(currentEmail, { name: name || currentEmail, x: 1500, y: 1500, hp: 100, maxHp: 100 });
+    socket.join(`pvp:${chatId}`);
+    const others = Array.from(room.entries())
+      .filter(([email]) => email !== currentEmail)
+      .map(([email, p]) => ({ email, ...p }));
+    socket.emit('pvp:init', { players: others });
+    socket.to(`pvp:${chatId}`).emit('pvp:player-joined', { email: currentEmail, ...room.get(currentEmail) });
+  });
+
+  socket.on('pvp:move', ({ chatId, x, y, facing }) => {
+    const room = gamePlayers.get(chatId);
+    if (!room || !room.has(currentEmail)) return;
+    const p = room.get(currentEmail);
+    p.x = x; p.y = y;
+    socket.to(`pvp:${chatId}`).emit('pvp:player-moved', { email: currentEmail, x, y, facing });
+  });
+
+  socket.on('pvp:attack', ({ chatId, targetEmail, damage }) => {
+    const room = gamePlayers.get(chatId);
+    if (!room || !room.has(targetEmail)) return;
+    const target = room.get(targetEmail);
+    if (target.hp <= 0) return;
+    target.hp = Math.max(0, target.hp - (Number(damage) || 10));
+    io.to(`pvp:${chatId}`).emit('pvp:player-hit', { email: targetEmail, hp: target.hp, attacker: currentEmail });
+  });
+
+  socket.on('pvp:respawn', ({ chatId, x, y }) => {
+    const room = gamePlayers.get(chatId);
+    if (!room || !room.has(currentEmail)) return;
+    const p = room.get(currentEmail);
+    p.hp = p.maxHp; p.x = x; p.y = y;
+    socket.to(`pvp:${chatId}`).emit('pvp:player-respawned', { email: currentEmail, x, y });
+  });
+
+  function leavePvp(chatId) {
+    const room = gamePlayers.get(chatId);
+    if (!room || !currentEmail) return;
+    room.delete(currentEmail);
+    socket.to(`pvp:${chatId}`).emit('pvp:player-left', { email: currentEmail });
+    if (room.size === 0) gamePlayers.delete(chatId);
+  }
+  socket.on('pvp:leave', ({ chatId }) => leavePvp(chatId));
+
   socket.on('disconnect', () => {
     if (!currentEmail) return;
     for (const chatId of activeGroupCalls.keys()) leaveGroupCallRoom(chatId);
     for (const [chatId, set] of activeGames.entries()) {
       if (set.has(currentEmail)) { set.delete(currentEmail); if (set.size === 0) activeGames.delete(chatId); broadcastChatPresence(chatId); }
     }
+    for (const chatId of gamePlayers.keys()) leavePvp(chatId);
   });
 });
 

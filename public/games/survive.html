@@ -32,6 +32,10 @@
   #gameOverScreen h2{font-size:38px;color:#ff6b6b;}
   #joystick{position:fixed;bottom:30px;left:30px;width:110px;height:110px;border-radius:50%;background:#ffffff14;border:2px solid #ffffff44;display:none;pointer-events:all;}
   #stick{position:absolute;width:50px;height:50px;border-radius:50%;background:#ffffff55;top:30px;left:30px;}
+  #fullscreenBtn{position:fixed;top:10px;right:10px;z-index:25;width:40px;height:40px;border-radius:8px;background:#0009;border:1px solid #fff5;color:#fff;font-size:18px;cursor:pointer;pointer-events:all;}
+  #attackBtn{position:fixed;bottom:36px;right:30px;width:88px;height:88px;border-radius:50%;background:#e74c3ccc;border:3px solid #fff8;color:#fff;font-size:15px;font-weight:bold;cursor:pointer;pointer-events:all;z-index:15;}
+  #attackBtn:active{background:#ff6b5c;}
+  #pvpToast{position:fixed;top:56px;left:50%;transform:translateX(-50%);color:#ff6b6b;font-weight:bold;font-size:16px;text-shadow:0 2px 4px #000;pointer-events:none;z-index:15;}
 </style>
 </head>
 <body>
@@ -50,6 +54,9 @@
 </div>
 
 <div id="joystick"><div id="stick"></div></div>
+<button id="fullscreenBtn" title="全画面表示">⛶</button>
+<button id="attackBtn">⚔️ 攻撃</button>
+<div id="pvpToast"></div>
 
 <div id="startScreen">
   <h1>SURVIVE</h1>
@@ -69,6 +76,7 @@
   <button class="bigBtn" id="retryBtn">RETRY</button>
 </div>
 
+<script src="/socket.io/socket.io.js"></script>
 <script>
 (() => {
 'use strict';
@@ -77,6 +85,18 @@ const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
 function resize(){canvas.width=innerWidth;canvas.height=innerHeight;}
 resize(); addEventListener('resize', resize);
+
+// ---------- フルスクリーン ----------
+const fsBtn = document.getElementById('fullscreenBtn');
+fsBtn.onclick = () => {
+  if (!document.fullscreenElement) {
+    (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement);
+    fsBtn.textContent = '⛶';
+  } else {
+    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+  }
+};
+document.addEventListener('fullscreenchange', () => { fsBtn.textContent = document.fullscreenElement ? '⤢' : '⛶'; });
 
 // ---------- Utility ----------
 const rand = (a,b)=>a+Math.random()*(b-a);
@@ -165,6 +185,89 @@ function reset(){
   elapsed = 0; killCount = 0; spawnTimer = 0; difficultyTimer=0;
   camera.x = player.x; camera.y = player.y;
 }
+
+// ---------- オンラインPvP ----------
+const qs = new URLSearchParams(location.search);
+const myEmail = qs.get('email') || '';
+const myName = qs.get('name') || 'プレイヤー';
+const pvpChatId = qs.get('chatId') || '';
+let otherPlayers = {}; // email -> {name,x,y,hp,maxHp,facing}
+let pvpSocket = null;
+const ATTACK_RANGE = 70, ATTACK_DAMAGE = 14, ATTACK_COOLDOWN = 0.5;
+let attackCd = 0;
+let respawning = false;
+
+function initPvp(){
+  if (!pvpChatId || !myEmail || typeof io === 'undefined') return;
+  pvpSocket = io();
+  pvpSocket.on('connect', () => {
+    pvpSocket.emit('auth', myEmail);
+    pvpSocket.emit('pvp:join', { chatId: pvpChatId, name: myName });
+  });
+  pvpSocket.on('pvp:init', ({ players }) => {
+    otherPlayers = {};
+    (players||[]).forEach(p => { otherPlayers[p.email] = p; });
+  });
+  pvpSocket.on('pvp:player-joined', (p) => { otherPlayers[p.email] = p; pvpToast(`${p.name} が参加しました`); });
+  pvpSocket.on('pvp:player-moved', (p) => {
+    const o = otherPlayers[p.email];
+    if (o) { o.x = p.x; o.y = p.y; o.facing = p.facing; }
+  });
+  pvpSocket.on('pvp:player-hit', ({ email, hp, attacker }) => {
+    if (email === myEmail) {
+      player.hp = hp;
+      player.invuln = 0.3;
+      flashScreen();
+      if (hp <= 0 && !respawning) doRespawn(attacker);
+    } else if (otherPlayers[email]) {
+      otherPlayers[email].hp = hp;
+    }
+  });
+  pvpSocket.on('pvp:player-respawned', ({ email, x, y }) => {
+    if (otherPlayers[email]) { otherPlayers[email].hp = otherPlayers[email].maxHp || 100; otherPlayers[email].x = x; otherPlayers[email].y = y; }
+  });
+  pvpSocket.on('pvp:player-left', ({ email }) => { delete otherPlayers[email]; });
+}
+
+function pvpToast(text){
+  const el = document.getElementById('pvpToast');
+  el.textContent = text;
+  el.style.opacity = 1;
+  clearTimeout(pvpToast._t);
+  pvpToast._t = setTimeout(() => { el.style.opacity = 0; }, 2000);
+}
+
+function doRespawn(attackerEmail){
+  respawning = true;
+  if (attackerEmail && otherPlayers[attackerEmail]) pvpToast(`${otherPlayers[attackerEmail].name} にやられた！`);
+  setTimeout(() => {
+    player.hp = player.maxHp;
+    player.x = clamp(player.x + rand(-200,200), 40, WORLD_SIZE-40);
+    player.y = clamp(player.y + rand(-200,200), 40, WORLD_SIZE-40);
+    if (pvpSocket) pvpSocket.emit('pvp:respawn', { chatId: pvpChatId, x: player.x, y: player.y });
+    respawning = false;
+  }, 1200);
+}
+
+function tryAttack(){
+  if (attackCd > 0 || !pvpSocket) return;
+  let nearest = null, bestD = ATTACK_RANGE*ATTACK_RANGE;
+  for (const email in otherPlayers) {
+    const o = otherPlayers[email];
+    if (!o || o.hp <= 0) continue;
+    const dx = o.x-player.x, dy = o.y-player.y, d = dx*dx+dy*dy;
+    if (d < bestD) { bestD = d; nearest = email; }
+  }
+  attackCd = ATTACK_COOLDOWN;
+  if (nearest) {
+    pvpSocket.emit('pvp:attack', { chatId: pvpChatId, targetEmail: nearest, damage: ATTACK_DAMAGE });
+    spawnHitParticle(otherPlayers[nearest].x, otherPlayers[nearest].y);
+  }
+}
+document.getElementById('attackBtn').onclick = tryAttack;
+addEventListener('keydown', e => { if (e.key === ' ' || e.key.toLowerCase()==='f') tryAttack(); });
+
+let moveSendTimer = 0;
 
 // ---------- Enemy templates ----------
 function enemyTemplate(minute){
@@ -458,6 +561,14 @@ function update(dt){
   for(const t of toastQueue) t.t -= dt;
   toastQueue = toastQueue.filter(t=>t.t>0);
 
+  // PvP: 位置を定期送信、攻撃クールダウン処理
+  attackCd = Math.max(0, attackCd-dt);
+  moveSendTimer -= dt;
+  if (moveSendTimer <= 0 && pvpSocket) {
+    moveSendTimer = 0.08;
+    pvpSocket.emit('pvp:move', { chatId: pvpChatId, x: player.x, y: player.y, facing: player.facing });
+  }
+
   updateHUD();
 }
 
@@ -559,6 +670,21 @@ function draw(){
     ctx.globalAlpha = 1;
   }
 
+  // 他プレイヤー(PvP)
+  for(const email in otherPlayers){
+    const o = otherPlayers[email];
+    if (!o || o.hp<=0) continue;
+    const s = worldToScreen(o.x,o.y);
+    ctx.fillStyle = '#ff6b6b';
+    ctx.beginPath(); ctx.arc(s.x,s.y,16,0,7); ctx.fill();
+    ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+    ctx.fillStyle='#000a'; ctx.fillRect(s.x-20, s.y-32, 40, 5);
+    ctx.fillStyle='#ff5b5b'; ctx.fillRect(s.x-20, s.y-32, 40*clamp(o.hp/(o.maxHp||100),0,1), 5);
+    ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='bold 12px sans-serif';
+    ctx.fillText(o.name||'???', s.x, s.y-38);
+    ctx.textAlign='left';
+  }
+
   // player
   {
     const s = worldToScreen(player.x,player.y);
@@ -623,6 +749,7 @@ function startGame(){
   running = true; paused=false;
   lastTime = performance.now();
   requestAnimationFrame(loop);
+  if (!pvpSocket) initPvp();
 }
 
 function endGame(victory){
