@@ -65,10 +65,10 @@ async function authFetch(url, options = {}) {
 const jsonHeaders = { 'Content-Type': 'application/json' };
 
 const api = {
-  authCheck: (email) => fetch('/api/auth/check', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email }) }).then((r) => r.json()),
-  register: (email, name, password) => fetch('/api/register', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, name, password }) }).then((r) => r.json()),
-  login: (email, password) => fetch('/api/login', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, password }) }).then((r) => r.json()),
-  setPassword: (email, password) => fetch('/api/set-password', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ email, password }) }).then((r) => r.json()),
+  authCheck: (identifier) => fetch('/api/auth/check', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ identifier }) }).then((r) => r.json()),
+  register: (data) => fetch('/api/register', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(data) }).then((r) => r.json()),
+  login: (identifier, password) => fetch('/api/login', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ identifier, password }) }).then((r) => r.json()),
+  setPassword: (identifier, password) => fetch('/api/set-password', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ identifier, password }) }).then((r) => r.json()),
   me: () => authFetch('/api/me'),
   directory: () => authFetch('/api/directory'),
   profile: (data) => authFetch('/api/profile', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify(data) }),
@@ -214,91 +214,97 @@ function renderLoginEmailStep() {
   const body = document.getElementById('login-body');
   body.innerHTML = `
     <form id="login-form">
-      <input class="field" type="email" id="login-email" placeholder="you@example.com" autofocus required />
+      <input class="field" type="text" id="login-identifier" placeholder="ユーザー名 または メールアドレス" autofocus required />
       <div id="login-error" class="error-text" style="display:none"></div>
       <button class="btn-primary" type="submit" id="login-submit">続ける</button>
     </form>`;
   document.getElementById('login-form').onsubmit = async (e) => {
     e.preventDefault();
-    const email = document.getElementById('login-email').value.trim().toLowerCase();
+    const identifier = document.getElementById('login-identifier').value.trim().toLowerCase();
     const btn = document.getElementById('login-submit');
     btn.disabled = true; btn.textContent = '確認中…';
-    const res = await api.authCheck(email);
+    const res = await api.authCheck(identifier);
     btn.disabled = false; btn.textContent = '続ける';
     if (res.error) { showLoginError(res.error); return; }
-    if (!res.exists) renderSignupStep(email);
-    else if (!res.hasPassword) renderSetInitialPasswordStep(email);
-    else renderPasswordLoginStep(email);
+    if (!res.exists) renderSignupStep(identifier);
+    else if (!res.hasPassword) renderSetInitialPasswordStep(identifier);
+    else renderPasswordLoginStep(identifier);
   };
 }
 
-function renderSignupStep(email) {
+function renderSignupStep(prefill) {
+  const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(prefill);
   const body = document.getElementById('login-body');
   body.innerHTML = `
-    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)} は新規アカウントです。表示名とパスワードを入力してください。</p>
+    <p style="font-size:13px;color:#456;margin-top:0">新規アカウントを作成します。メールアドレスは任意です(未入力でも登録できます)。</p>
     <form id="login-form2">
       <input class="field" id="signup-name" placeholder="表示名" autofocus required />
+      <input class="field" id="signup-username" placeholder="ユーザー名(半角英数字, 3〜20文字)" value="${!isEmail ? esc(prefill) : ''}" />
+      <input class="field" id="signup-email" type="email" placeholder="メールアドレス(任意)" value="${isEmail ? esc(prefill) : ''}" />
       <input class="field" id="signup-password" type="password" placeholder="パスワード(6文字以上)" required minlength="6" />
       <input class="field" id="signup-password2" type="password" placeholder="パスワード(確認)" required minlength="6" />
       <div id="login-error" class="error-text" style="display:none"></div>
       <button class="btn-primary" type="submit">アカウント作成してはじめる</button>
     </form>
-    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+    <button type="button" id="back-to-email" class="link-btn">戻る</button>`;
   document.getElementById('back-to-email').onclick = renderLoginEmailStep;
   document.getElementById('login-form2').onsubmit = async (e) => {
     e.preventDefault();
     const name = document.getElementById('signup-name').value.trim();
+    const username = document.getElementById('signup-username').value.trim();
+    const email = document.getElementById('signup-email').value.trim();
     const password = document.getElementById('signup-password').value;
     const password2 = document.getElementById('signup-password2').value;
     if (password !== password2) { showLoginError('パスワードが一致しません'); return; }
-    const res = await api.register(email, name, password);
+    if (!email && !username) { showLoginError('メールアドレスを入力しない場合、ユーザー名が必要です'); return; }
+    const res = await api.register({ name, username, email, password });
     if (res.error) { showLoginError(res.error); return; }
     setToken(res.token);
     onLoggedIn(res.user);
   };
 }
 
-function renderSetInitialPasswordStep(email) {
+function renderSetInitialPasswordStep(identifier) {
   const body = document.getElementById('login-body');
   body.innerHTML = `
-    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)} は以前パスワードなしで作られたアカウントです。安全のため、パスワードを設定してください。</p>
+    <p style="font-size:13px;color:#456;margin-top:0">${esc(identifier)} は以前パスワードなしで作られたアカウントです。安全のため、パスワードを設定してください。</p>
     <form id="login-form3">
       <input class="field" id="init-password" type="password" placeholder="パスワード(6文字以上)" autofocus required minlength="6" />
       <input class="field" id="init-password2" type="password" placeholder="パスワード(確認)" required minlength="6" />
       <div id="login-error" class="error-text" style="display:none"></div>
       <button class="btn-primary" type="submit">パスワードを設定してログイン</button>
     </form>
-    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+    <button type="button" id="back-to-email" class="link-btn">戻る</button>`;
   document.getElementById('back-to-email').onclick = renderLoginEmailStep;
   document.getElementById('login-form3').onsubmit = async (e) => {
     e.preventDefault();
     const password = document.getElementById('init-password').value;
     const password2 = document.getElementById('init-password2').value;
     if (password !== password2) { showLoginError('パスワードが一致しません'); return; }
-    const res = await api.setPassword(email, password);
+    const res = await api.setPassword(identifier, password);
     if (res.error) { showLoginError(res.error); return; }
     setToken(res.token);
     onLoggedIn(res.user);
   };
 }
 
-function renderPasswordLoginStep(email) {
+function renderPasswordLoginStep(identifier) {
   const body = document.getElementById('login-body');
   body.innerHTML = `
-    <p style="font-size:13px;color:#456;margin-top:0">${esc(email)}</p>
+    <p style="font-size:13px;color:#456;margin-top:0">${esc(identifier)}</p>
     <form id="login-form4">
       <input class="field" id="login-password" type="password" placeholder="パスワード" autofocus required />
       <div id="login-error" class="error-text" style="display:none"></div>
       <button class="btn-primary" type="submit">ログイン</button>
     </form>
     <button type="button" id="forgot-password-btn" class="link-btn">パスワードをお忘れですか？</button>
-    <button type="button" id="back-to-email" class="link-btn">別のメールアドレスを使う</button>`;
+    <button type="button" id="back-to-email" class="link-btn">戻る</button>`;
   document.getElementById('back-to-email').onclick = renderLoginEmailStep;
-  document.getElementById('forgot-password-btn').onclick = () => renderForgotPasswordStep(email);
+  document.getElementById('forgot-password-btn').onclick = () => renderForgotPasswordStep(identifier);
   document.getElementById('login-form4').onsubmit = async (e) => {
     e.preventDefault();
     const password = document.getElementById('login-password').value;
-    const res = await api.login(email, password);
+    const res = await api.login(identifier, password);
     if (res.error) { showLoginError(res.error); return; }
     if (res.requires2FA) { renderTwoFactorLoginStep(res.pendingToken); return; }
     setToken(res.token);
@@ -327,12 +333,13 @@ function renderTwoFactorLoginStep(pendingToken) {
   };
 }
 
-function renderForgotPasswordStep(email) {
+function renderForgotPasswordStep(identifier) {
+  const prefill = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identifier || '') ? identifier : '';
   const body = document.getElementById('login-body');
   body.innerHTML = `
     <p style="font-size:13px;color:#456;margin-top:0">登録されているメールアドレスにパスワード再設定用のリンクを送信します。</p>
     <form id="forgot-form">
-      <input class="field" type="email" id="forgot-email" value="${esc(email || '')}" placeholder="you@example.com" required />
+      <input class="field" type="email" id="forgot-email" value="${esc(prefill)}" placeholder="you@example.com" required />
       <div id="login-error" class="error-text" style="display:none"></div>
       <button class="btn-primary" type="submit">再設定メールを送信</button>
     </form>

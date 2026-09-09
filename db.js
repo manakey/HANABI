@@ -71,6 +71,11 @@ async function initSchema() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON public.messages(chat_id, ts);`);
+  // メールアドレス任意化: PKに使う識別子(email列)とは別に、パスワード再設定用の連絡先メールを保持
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS contact_email TEXT;`);
+  // メールアドレスを入力しない場合のログインID(ユーザー名)
+  await pool.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS username TEXT;`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON public.users(username) WHERE username IS NOT NULL;`);
   console.log('[db] スキーマの準備ができました');
 }
 
@@ -89,6 +94,8 @@ function mapUser(row) {
     blockedUsers: row.blocked_users || [],
     twoFactorEnabled: row.two_factor_enabled || false,
     chatBackgrounds: row.chat_backgrounds || {},
+    contactEmail: row.contact_email || null,
+    username: row.username || null,
   };
 }
 
@@ -132,10 +139,10 @@ async function getUser(email) {
   return mapUser(rows[0]);
 }
 
-async function createUser({ email, name, avatar, bg, createdAt, passwordHash }) {
+async function createUser({ email, name, avatar, bg, createdAt, passwordHash, contactEmail, username }) {
   const { rows } = await pool.query(
-    `INSERT INTO public.users (email, name, avatar, bg, created_at, password_hash) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [email, name, avatar, bg, createdAt, passwordHash || null]
+    `INSERT INTO public.users (email, name, avatar, bg, created_at, password_hash, contact_email, username) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [email, name, avatar, bg, createdAt, passwordHash || null, contactEmail || null, username || null]
   );
   return mapUser(rows[0]);
 }
@@ -144,6 +151,20 @@ async function createUser({ email, name, avatar, bg, createdAt, passwordHash }) 
 async function getUserAuth(email) {
   const { rows } = await pool.query('SELECT email, password_hash FROM public.users WHERE email=$1', [email]);
   return rows[0] || null;
+}
+
+// ログインID(ユーザー名 または メールアドレス)からアカウントを検索する
+async function getUserAuthByIdentifier(identifier) {
+  const { rows } = await pool.query(
+    'SELECT email, password_hash FROM public.users WHERE username=$1 OR email=$1 OR contact_email=$1 LIMIT 1',
+    [identifier]
+  );
+  return rows[0] || null;
+}
+
+async function getUserByUsername(username) {
+  const { rows } = await pool.query('SELECT * FROM public.users WHERE username=$1', [username]);
+  return mapUser(rows[0]);
 }
 
 // 通常のパスワード変更(既にパスワードがあっても上書きする)
@@ -422,7 +443,7 @@ module.exports = {
   pool,
   initSchema,
   getUser, createUser, updateUserProfile, listUsers,
-  getUserAuth, setPassword, setInitialPassword,
+  getUserAuth, getUserAuthByIdentifier, getUserByUsername, setPassword, setInitialPassword,
   getPushSubscriptions, setPushSubscriptions, addPushSubscription, removePushSubscription,
   getMutedChats, toggleMuteChat, isChatMuted,
   getBlockedUsers, blockUser, unblockUser, isBlocked,

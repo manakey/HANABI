@@ -168,11 +168,13 @@ function uploadBufferToCloudinary(buffer) {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // メールアドレスの登録状況を確認(アカウント作成/ログイン/パスワード未設定 のどれに進むか判定するため)
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+
 app.post('/api/auth/check', async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
-  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
+  const identifier = (req.body.identifier || req.body.email || '').trim().toLowerCase();
+  if (!identifier) return res.status(400).json({ error: 'ユーザー名またはメールアドレスを入力してください' });
   try {
-    const auth = await db.getUserAuth(email);
+    const auth = await db.getUserAuthByIdentifier(identifier);
     res.json({ exists: !!auth, hasPassword: !!(auth && auth.password_hash) });
   } catch (err) {
     console.error('auth check error:', err);
@@ -180,51 +182,66 @@ app.post('/api/auth/check', async (req, res) => {
   }
 });
 
-// 新規アカウント作成
+// 新規アカウント作成(メールアドレスは任意。未入力の場合はユーザー名が必須)
 app.post('/api/register', async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
+  const username = (req.body.username || '').trim().toLowerCase();
+  const emailInput = (req.body.email || '').trim().toLowerCase();
   const name = (req.body.name || '').trim();
   const password = req.body.password || '';
-  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
   if (!name) return res.status(400).json({ error: '表示名を入力してください' });
   if (password.length < 6) return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
+  if (emailInput && !EMAIL_RE.test(emailInput)) return res.status(400).json({ error: 'メールアドレスの形式が正しくありません' });
+  if (!emailInput && !USERNAME_RE.test(username)) {
+    return res.status(400).json({ error: 'メールアドレスを入力しない場合、ユーザー名(半角英数字とアンダースコアで3〜20文字)が必要です' });
+  }
   try {
-    const existing = await db.getUserAuth(email);
+    if (username) {
+      if (!USERNAME_RE.test(username)) return res.status(400).json({ error: 'ユーザー名は半角英数字とアンダースコアで3〜20文字にしてください' });
+      const existingUsername = await db.getUserByUsername(username);
+      if (existingUsername) return res.status(409).json({ error: 'このユーザー名は既に使われています' });
+    }
+    // 内部識別子(email列)は必ず値を持つ必要があるため、メール未入力時はユーザー名からダミー識別子を生成する
+    const internalEmail = emailInput || `${username}@users.hanabi.local`;
+    const existing = await db.getUserAuth(internalEmail);
     if (existing) return res.status(409).json({ error: 'このメールアドレスは既に登録されています' });
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await db.createUser({
-      email, name,
+      email: internalEmail,
+      username: username || null,
+      contactEmail: emailInput || null,
+      name,
       avatar: AVATAR_EMOJIS[Math.floor(Math.random() * AVATAR_EMOJIS.length)],
       bg: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
       createdAt: Date.now(),
       passwordHash,
     });
-    res.json({ user, token: signToken(email) });
+    res.json({ user, token: signToken(internalEmail) });
   } catch (err) {
     console.error('register error:', err);
     res.status(500).json({ error: 'サーバーエラーが発生しました' });
   }
 });
 
-// 既存アカウント(パスワード設定済み)でのログイン
+// 既存アカウント(パスワード設定済み)でのログイン(ユーザー名またはメールアドレス)
 app.post('/api/login', async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
+  const identifier = (req.body.identifier || req.body.email || '').trim().toLowerCase();
   const password = req.body.password || '';
   try {
-    const auth = await db.getUserAuth(email);
-    if (!auth || !auth.password_hash) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+    const auth = await db.getUserAuthByIdentifier(identifier);
+    if (!auth || !auth.password_hash) return res.status(401).json({ error: 'ユーザー名/メールアドレスまたはパスワードが違います' });
     const ok = await bcrypt.compare(password, auth.password_hash);
-    if (!ok) return res.status(401).json({ error: 'メールアドレスまたはパスワードが違います' });
+    if (!ok) return res.status(401).json({ error: 'ユーザー名/メールアドレスまたはパスワードが違います' });
+    const canonicalEmail = auth.email; // 内部識別子(PK)
 
-    const totpAuth = await db.getTotpAuth(email);
+    const totpAuth = await db.getTotpAuth(canonicalEmail);
     if (totpAuth && totpAuth.two_factor_enabled) {
       // 2段階認証が有効なユーザーは、まだ完全なトークンを発行せず認証コード入力を要求する
-      const pendingToken = jwt.sign({ email, pending2FA: true }, JWT_SECRET, { expiresIn: '10m' });
+      const pendingToken = jwt.sign({ email: canonicalEmail, pending2FA: true }, JWT_SECRET, { expiresIn: '10m' });
       return res.json({ requires2FA: true, pendingToken });
     }
 
-    const user = await db.getUser(email);
-    res.json({ user, token: signToken(email) });
+    const user = await db.getUser(canonicalEmail);
+    res.json({ user, token: signToken(canonicalEmail) });
   } catch (err) {
     console.error('login error:', err);
     res.status(500).json({ error: 'サーバーエラーが発生しました' });
@@ -256,16 +273,16 @@ app.post('/api/2fa/login-verify', async (req, res) => {
 // パスワード導入前から使っていた既存アカウント向け: 初回のみパスワードを設定できる
 // (第三者による乗っ取り防止のため、既にパスワードが設定済みの場合はここでは変更させない)
 app.post('/api/set-password', async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
+  const identifier = (req.body.identifier || req.body.email || '').trim().toLowerCase();
   const password = req.body.password || '';
   if (password.length < 6) return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
   try {
-    const auth = await db.getUserAuth(email);
+    const auth = await db.getUserAuthByIdentifier(identifier);
     if (!auth) return res.status(404).json({ error: 'アカウントが見つかりません' });
     if (auth.password_hash) return res.status(409).json({ error: '既にパスワードが設定されています。ログインをご利用ください' });
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await db.setPassword(email, passwordHash);
-    res.json({ user, token: signToken(email) });
+    const user = await db.setPassword(auth.email, passwordHash);
+    res.json({ user, token: signToken(auth.email) });
   } catch (err) {
     console.error('set-password error:', err);
     res.status(500).json({ error: 'サーバーエラーが発生しました' });
