@@ -489,6 +489,18 @@ function connectSocket() {
     if (state.call && state.call.callId === data.callId) endCallLocal();
   });
   socket.on('call:declined', (data) => { if (state.call && state.call.callId === data.callId) { setCallStatus('相手が応答しませんでした'); setTimeout(endCallLocal, 1200); } });
+  // 画面共有ON/OFFやカメラ切替でトラック構成が変わった時の再ネゴシエーション
+  socket.on('call:renegotiate-offer', async (data) => {
+    if (!state.call || state.call.callId !== data.callId || !pc) return;
+    await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    state.socket.emit('call:renegotiate-answer', { toEmail: data.fromEmail, fromEmail: state.user.email, callId: data.callId, answer: { type: answer.type, sdp: answer.sdp } });
+  });
+  socket.on('call:renegotiate-answer', async (data) => {
+    if (!state.call || state.call.callId !== data.callId || !pc) return;
+    await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+  });
 
   socket.on('message:blocked', ({ chatId }) => {
     if (chatId === state.activeChatId) {
@@ -1608,10 +1620,13 @@ let localStream = null, pc = null, remoteStream = null, appliedIceStart = 0;
 
 // マイク+カメラの両方を要求し、カメラが使えない/拒否された場合はマイクのみにフォールバックする
 async function acquireCallStream() {
-  try { return await navigator.mediaDevices.getUserMedia({ audio: true, video: true }); }
+  try { return await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: 'user' } }); }
   catch {
-    try { return await navigator.mediaDevices.getUserMedia({ audio: true }); }
-    catch { return null; }
+    try { return await navigator.mediaDevices.getUserMedia({ audio: true, video: true }); }
+    catch {
+      try { return await navigator.mediaDevices.getUserMedia({ audio: true }); }
+      catch { return null; }
+    }
   }
 }
 
@@ -1627,12 +1642,20 @@ function callBtnHTML() {
         </div>
         <video class="call-video-local" id="local-video" autoplay playsinline muted style="display:none"></video>
       </div>
-      <div class="call-controls">
+      <div class="call-controls" style="padding-bottom:calc(10px + env(safe-area-inset-bottom));flex-wrap:wrap">
         <button class="call-btn" id="call-mic-btn">🎤</button>
         <button class="call-btn" id="call-cam-btn" style="display:none">📷</button>
+        <button class="call-btn" id="call-switch-cam-btn" style="display:none">🔄</button>
+        <button class="call-btn" id="call-screen-btn" style="display:none">🖥️</button>
         <button class="call-btn end" id="call-end-btn">📵</button>
       </div>
     </div>`;
+}
+
+// この端末/ブラウザが画面共有(getDisplayMedia)に対応しているか。iPadはiPadOS 17+ Safariのみ対応で、
+// 古いiPadやSafari以外の一部ブラウザでは未対応のため、ボタン自体を出し分ける。
+function supportsScreenShare() {
+  return !!(navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function');
 }
 
 function setCallStatus(text) {
@@ -1644,8 +1667,11 @@ function setCallStatus(text) {
 function applyLocalCamState() {
   const lv = document.getElementById('local-video');
   const camBtn = document.getElementById('call-cam-btn');
+  const switchBtn = document.getElementById('call-switch-cam-btn');
   const hasVideoTrack = localStream && localStream.getVideoTracks().length > 0;
   if (camBtn) camBtn.style.display = hasVideoTrack ? 'flex' : 'none';
+  // カメラ切替ボタンは「カメラがON、かつ画面共有中でない」時だけ表示する
+  if (switchBtn) switchBtn.style.display = (hasVideoTrack && state.call.camOn && !state.call.sharingScreen) ? 'flex' : 'none';
   if (!hasVideoTrack) { if (state.call) state.call.camOn = false; return; }
   localStream.getVideoTracks().forEach((t) => t.enabled = state.call.camOn);
   if (state.call.camOn) { lv.srcObject = localStream; lv.style.display = 'block'; }
@@ -1663,7 +1689,7 @@ function applyRemoteCamState() {
 
 async function startCall(peer) {
   const callId = uid('call');
-  state.call = { callId, chatId: state.activeChatId, peer, isCaller: true, micOn: true, camOn: false, remoteCamOn: false };
+  state.call = { callId, chatId: state.activeChatId, peer, isCaller: true, micOn: true, camOn: false, remoteCamOn: false, sharingScreen: false, facingMode: 'user' };
   appliedIceStart = 0;
   document.body.insertAdjacentHTML('beforeend', callBtnHTML());
   document.getElementById('call-peer-name').textContent = peer.name;
@@ -1677,6 +1703,8 @@ async function startCall(peer) {
     return;
   }
   applyLocalCamState();
+  const screenBtn = document.getElementById('call-screen-btn');
+  if (screenBtn) screenBtn.style.display = supportsScreenShare() ? 'flex' : 'none';
 
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
@@ -1718,7 +1746,7 @@ function renderIncomingCall() {
 async function acceptIncoming(data, peer, overlay) {
   document.body.removeChild(overlay);
   state.incomingCall = null;
-  state.call = { callId: data.callId, chatId: data.chatId, peer, isCaller: false, micOn: true, camOn: false, remoteCamOn: false };
+  state.call = { callId: data.callId, chatId: data.chatId, peer, isCaller: false, micOn: true, camOn: false, remoteCamOn: false, sharingScreen: false, facingMode: 'user' };
   appliedIceStart = 0;
   document.body.insertAdjacentHTML('beforeend', callBtnHTML());
   document.getElementById('call-peer-name').textContent = peer.name;
@@ -1733,6 +1761,8 @@ async function acceptIncoming(data, peer, overlay) {
     return;
   }
   applyLocalCamState();
+  const screenBtn = document.getElementById('call-screen-btn');
+  if (screenBtn) screenBtn.style.display = supportsScreenShare() ? 'flex' : 'none';
 
   pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
@@ -1775,15 +1805,118 @@ function wireCallControls() {
     btn.classList.toggle('off', !state.call.camOn);
     btn.textContent = state.call.camOn ? '📷' : '🚫';
   };
+  document.getElementById('call-switch-cam-btn').onclick = () => switchCamera();
+  document.getElementById('call-screen-btn').onclick = () => {
+    if (state.call.sharingScreen) stopScreenShare(); else startScreenShare();
+  };
   document.getElementById('call-end-btn').onclick = () => {
     if (state.call) state.socket.emit('call:end', { toEmail: state.call.peer.email, callId: state.call.callId });
     endCallLocal();
   };
 }
 
+// pcの映像トラックを付け替える(既に映像トラックを送っていればreplaceTrackのみでOK=再ネゴシエーション不要。
+// まだ映像トラックを一度も送っていない(音声のみで発着信した)場合はaddTrackしてoffer/answerを再送する)
+async function setOutgoingVideoTrack(newTrack) {
+  if (!pc) return;
+  const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+  if (sender) {
+    await sender.replaceTrack(newTrack);
+  } else {
+    pc.addTrack(newTrack, localStream);
+    await renegotiate();
+  }
+}
+
+async function renegotiate() {
+  if (!pc || !state.call) return;
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  state.socket.emit('call:renegotiate-offer', {
+    toEmail: state.call.peer.email, fromEmail: state.user.email, callId: state.call.callId,
+    offer: { type: offer.type, sdp: offer.sdp },
+  });
+}
+
+// フロント/バックカメラ切替(iPad/iPhoneどちらも facingMode 制約で切替可能)
+async function switchCamera() {
+  if (!state.call || state.call.sharingScreen) return;
+  const nextFacing = state.call.facingMode === 'user' ? 'environment' : 'user';
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: nextFacing } });
+    const newTrack = newStream.getVideoTracks()[0];
+    const oldTrack = localStream.getVideoTracks()[0];
+    await setOutgoingVideoTrack(newTrack);
+    if (oldTrack) { localStream.removeTrack(oldTrack); oldTrack.stop(); }
+    localStream.addTrack(newTrack);
+    state.call.facingMode = nextFacing;
+    applyLocalCamState();
+  } catch (err) {
+    console.error('camera switch error:', err);
+    setCallStatus('カメラを切り替えられませんでした');
+    setTimeout(() => setCallStatus('通話中'), 1500);
+  }
+}
+
+// 画面共有を開始する。カメラ映像の代わりに画面共有トラックを相手へ送信し、
+// 終了時(ブラウザの「共有を停止」操作を含む)は自動でカメラ映像に戻す。
+async function startScreenShare() {
+  if (!state.call || !supportsScreenShare()) return;
+  try {
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    const screenTrack = displayStream.getVideoTracks()[0];
+    state.call.cameraTrackBackup = localStream.getVideoTracks()[0] || null; // 元のカメラトラックを保持(後で復元)
+    state.call.wasCamOnBeforeShare = state.call.camOn;
+    await setOutgoingVideoTrack(screenTrack);
+    screenTrack.onended = () => { if (state.call && state.call.sharingScreen) stopScreenShare(); };
+
+    state.call.sharingScreen = true;
+    state.call.camOn = true; // 画面共有中は「映像あり」として表示する
+    const lv = document.getElementById('local-video');
+    lv.srcObject = displayStream;
+    lv.style.display = 'block';
+    state.call.screenStream = displayStream;
+    state.socket.emit('call:video-state', { toEmail: state.call.peer.email, callId: state.call.callId, videoOn: true });
+
+    const screenBtn = document.getElementById('call-screen-btn');
+    if (screenBtn) { screenBtn.classList.add('off'); screenBtn.textContent = '🛑'; }
+    applyLocalCamState();
+  } catch (err) {
+    // ユーザーがブラウザの共有ダイアログをキャンセルした場合など
+    console.error('screen share error:', err);
+  }
+}
+
+async function stopScreenShare() {
+  if (!state.call || !state.call.sharingScreen) return;
+  const cam = state.call.cameraTrackBackup;
+  try {
+    if (cam && cam.readyState !== 'ended') {
+      await setOutgoingVideoTrack(cam);
+      localStream.addTrack(cam);
+    } else {
+      // 元のカメラトラックがもう使えない場合は新しく取得し直す
+      const fresh = await navigator.mediaDevices.getUserMedia({ video: { facingMode: state.call.facingMode } }).catch(() => null);
+      const freshTrack = fresh ? fresh.getVideoTracks()[0] : null;
+      if (freshTrack) { await setOutgoingVideoTrack(freshTrack); localStream.addTrack(freshTrack); }
+    }
+  } catch (err) { console.error('stop screen share error:', err); }
+
+  if (state.call.screenStream) state.call.screenStream.getTracks().forEach((t) => t.stop());
+  state.call.screenStream = null;
+  state.call.sharingScreen = false;
+  state.call.camOn = !!state.call.wasCamOnBeforeShare;
+  state.socket.emit('call:video-state', { toEmail: state.call.peer.email, callId: state.call.callId, videoOn: state.call.camOn });
+
+  const screenBtn = document.getElementById('call-screen-btn');
+  if (screenBtn) { screenBtn.classList.remove('off'); screenBtn.textContent = '🖥️'; }
+  applyLocalCamState();
+}
+
 function endCallLocal() {
   if (pc) { try { pc.close(); } catch {} pc = null; }
   if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  if (state.call && state.call.screenStream) { state.call.screenStream.getTracks().forEach((t) => t.stop()); }
   remoteStream = null;
   const overlay = document.getElementById('call-overlay');
   if (overlay) overlay.remove();

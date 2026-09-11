@@ -953,6 +953,9 @@ io.on('connection', (socket) => {
   socket.on('call:video-state', (data) => io.to(`user:${data.toEmail}`).emit('call:video-state', data));
   socket.on('call:end', (data) => io.to(`user:${data.toEmail}`).emit('call:ended', data));
   socket.on('call:decline', (data) => io.to(`user:${data.toEmail}`).emit('call:declined', data));
+  // 画面共有/カメラ切替などでトラック構成が変わった際の再ネゴシエーション(offer/answerを中継するだけ)
+  socket.on('call:renegotiate-offer', (data) => io.to(`user:${data.toEmail}`).emit('call:renegotiate-offer', data));
+  socket.on('call:renegotiate-answer', (data) => io.to(`user:${data.toEmail}`).emit('call:renegotiate-answer', data));
 
   // --- グループ通話 (WebRTCメッシュ構成、Socket.IOでシグナリング中継)
   //     参加者ごとにマイク/カメラを個別にON/OFFできる(Zoom風)。カメラ状態は参加者Mapで保持。 ---
