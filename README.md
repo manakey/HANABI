@@ -179,6 +179,3 @@ hanabi-chat/
 ├── uploads/             画像アップロード保存先
 └── db.json               (自動生成) 簡易データベース
 ```
-
-# 作成者
-manakey、クロード

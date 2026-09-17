@@ -178,7 +178,7 @@ html.dark {
 .call-name { font-weight: 700; font-size: 18px; }
 .call-status { font-size: 13px; opacity: 0.75; margin-top: 4px; }
 .call-video-local { position: absolute; bottom: 100px; right: 20px; width: 110px; height: 150px; object-fit: cover; border-radius: 12px; border: 2px solid #fff; background: #000; }
-.call-controls { padding: 22px 0 max(34px, env(safe-area-inset-bottom)); display: flex; justify-content: center; gap: 22px; }
+.call-controls { padding: 22px 0 max(34px, env(safe-area-inset-bottom)); display: flex; flex-wrap: wrap; justify-content: center; gap: 22px; }
 .call-btn { width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer; background: rgba(255,255,255,0.18); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 20px; }
 .call-btn.off { background: #E0453C; }
 .call-btn.end { background: #E0453C; }

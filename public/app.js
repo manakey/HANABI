@@ -1642,7 +1642,7 @@ function callBtnHTML() {
         </div>
         <video class="call-video-local" id="local-video" autoplay playsinline muted style="display:none"></video>
       </div>
-      <div class="call-controls" style="padding-bottom:calc(10px + env(safe-area-inset-bottom));flex-wrap:wrap">
+      <div class="call-controls">
         <button class="call-btn" id="call-mic-btn">🎤</button>
         <button class="call-btn" id="call-cam-btn" style="display:none">📷</button>
         <button class="call-btn" id="call-switch-cam-btn" style="display:none">🔄</button>
